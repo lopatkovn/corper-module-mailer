@@ -1,0 +1,81 @@
+# Developer's local stack for module "mailer".
+# Mirrors the module.json structure (frontend + backend + dedicated DB).
+#
+# Quick start (on developer's machine):
+#   docker compose -f docker-compose.dev.yml up --build
+#
+# Open http://localhost:5080 (frontend)
+# Login first on the prod portal http://10.101.10.181:5000/login — cookie
+# corper_token will be sent through Vite proxy when credentials: 'include'.
+#
+# Stop:
+#   docker compose -f docker-compose.dev.yml down
+# Reset DB:
+#   docker compose -f docker-compose.dev.yml down -v
+#
+# NOTE: this is a DEV stack. Production deploy happens on the portal server
+# via /admin/deploy (see DEPLOYMENT.md). DO NOT push test data created here
+# anywhere — use the PROD portal directly for staging.
+
+services:
+  # Vite dev server with hot reload. Proxies /api, /companies, /employees, /auth
+  # to PROD portal (http://10.101.10.181:5000) — see vite.config.ts.
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5080"
+    environment:
+      VITE_MODULE_NAME: mailer
+      VITE_MODULE_SECTION: notifications
+      VITE_PORTAL_URL: http://10.101.10.181:5000
+    volumes:
+      - .:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5080:5080"
+
+  # Backend with code reload. NOTE: nginx auth_request not available in dev —
+  # the backend's make_user_loader still reads X-Employee-Id header. For now,
+  # call /health (no auth) to verify the service runs. For protected endpoints,
+  # send X-Employee-Id header yourself (curl) or test against the deployed
+  # backend on the portal.
+  backend:
+    build: ./backend
+    working_dir: /app
+    command: gunicorn --bind 0.0.0.0:5000 --reload --workers 1 app:app
+    environment:
+      MODULE_NAME: mailer
+      DATABASE_URL: postgresql://dev:dev@db:5432/corper_mailer_dev?options=-csearch_path%3Dmailer
+      SECRET_KEY: dev-only-not-for-prod
+      CORE_REGISTRY_URL: http://10.101.10.181:5000
+    volumes:
+      - ./backend:/app
+    ports:
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Local dev database. Schema is created in init.sql.
+  # The PROD database (pg-mailer) is on the portal — NOT this container.
+  # Test data here, real data there.
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: corper_mailer_dev
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./backend/dev-init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d corper_mailer_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  frontend_node_modules:
+  pg_data:

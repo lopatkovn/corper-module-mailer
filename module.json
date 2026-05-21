@@ -1,0 +1,28 @@
+{
+  "name": "mailer",
+  "label": "Служба рассылок",
+  "icon": "send",
+  "section": "notifications",
+  "components": {
+    "frontend": {
+      "port": 80
+    },
+    "backend": {
+      "context": "backend",
+      "port": 5000,
+      "api_prefix": "/api/mailer",
+      "auth_required": true
+    }
+  },
+  "database": {
+    "mode": "dedicated",
+    "db_name": "corper_mailer",
+    "schema": "mailer",
+    "image": "postgres:16-alpine",
+    "volume": "pg-mailer-data"
+  },
+  "alembic": {
+    "enabled": true,
+    "workdir": "/app"
+  }
+}

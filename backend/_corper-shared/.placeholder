@@ -1,0 +1,3 @@
+# Placeholder so COPY _corper-shared in the Dockerfile always works.
+# Real package is injected by deploy-agent on the portal, or downloaded
+# at build time in dev — see the Dockerfile.
