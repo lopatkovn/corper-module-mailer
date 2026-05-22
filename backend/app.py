@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request, abort
 from flask_login import LoginManager, login_required, current_user
 from flask_sqlalchemy import SQLAlchemy
 
-from corper_shared.auth import make_user_loader, ProxyEmployee
+from corper_shared.auth import make_user_loader, make_request_loader, ProxyEmployee
 from corper_shared.service_client import CoreClient
 from corper_shared.context import active_company_id, require_section
 
@@ -33,7 +33,12 @@ db = SQLAlchemy(app)
 core = CoreClient(os.environ.get("CORE_REGISTRY_URL", "http://core-registry:5001"))
 
 login_manager = LoginManager(app)
+# user_loader — session-based вход (dev-консоль / standalone).
+# request_loader — ОБЯЗАТЕЛЬНО для портала: модуль в iframe stateless,
+# nginx auth_request кладёт личность в заголовок X-Employee-Id, и читает
+# его только request_loader. Без него все @login_required → 401 на портале.
 login_manager.user_loader(make_user_loader(core))
+login_manager.request_loader(make_request_loader(core, app.config["SECRET_KEY"]))
 
 
 from models import DemoItem  # noqa: E402
