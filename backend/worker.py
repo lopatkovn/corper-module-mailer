@@ -168,9 +168,13 @@ def _process_legacy_mail_queue() -> None:
     smtp_cfg = default_ch.config or {}
     from sqlalchemy import text as sql_text
     with _core_engine.begin() as conn:
+        # Только pending, у которых last_attempt_at NULL или старше 60с —
+        # чтобы не молотить SMTP при перманентной ошибке (DNS, креды).
         rows = conn.execute(sql_text(
             "SELECT id, to_addr, subject, body FROM core.mail_queue "
-            "WHERE status='pending' ORDER BY created_at ASC LIMIT 20 FOR UPDATE SKIP LOCKED"
+            "WHERE status='pending' "
+            "  AND (last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '60 seconds') "
+            "ORDER BY created_at ASC LIMIT 20 FOR UPDATE SKIP LOCKED"
         )).mappings().all()
         for row in rows:
             try:
@@ -186,11 +190,12 @@ def _process_legacy_mail_queue() -> None:
                     "WHERE id=:i"), {"i": row["id"]})
                 log.info("legacy mail_queue id=%s sent to=%s", row["id"], row["to_addr"])
             except SMTPError as e:
+                # Оставляем pending — будет ретрай через 60с. Только last_attempt_at
+                # и error_text. (notify-service вёл себя так же: бесконечный ретрай.)
                 conn.execute(sql_text(
-                    "UPDATE core.mail_queue SET status=CASE WHEN status='pending' THEN 'failed' ELSE status END, "
-                    "last_attempt_at=NOW(), error_text=:e WHERE id=:i"),
+                    "UPDATE core.mail_queue SET last_attempt_at=NOW(), error_text=:e WHERE id=:i"),
                     {"e": str(e)[:500], "i": row["id"]})
-                log.warning("legacy mail_queue id=%s failed err=%s", row["id"], e)
+                log.warning("legacy mail_queue id=%s pending-retry err=%s", row["id"], e)
 
 
 def thread_a_outbox():
