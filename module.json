@@ -12,6 +12,10 @@
       "port": 5000,
       "api_prefix": "/api/mailer",
       "auth_required": true
+    },
+    "worker": {
+      "context": "backend",
+      "command": "python worker.py"
     }
   },
   "database": {
@@ -24,5 +28,6 @@
   "alembic": {
     "enabled": true,
     "workdir": "/app"
-  }
+  },
+  "emits": []
 }
