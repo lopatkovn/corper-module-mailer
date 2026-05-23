@@ -534,6 +534,10 @@ def create_rule():
     data = request.get_json(force=True) or {}
     if not data.get("event_type_id") or not data.get("channel_id"):
         return jsonify({"error": "event_type_id и channel_id обязательны"}), 400
+    # Валидация существования event_type
+    et = EventType.query.get(int(data["event_type_id"]))
+    if et is None:
+        return jsonify({"error": "event_type не найден"}), 400
     # Валидация принадлежности канала компании
     ch = Channel.query.get(int(data["channel_id"]))
     if ch is None or ch.company_id != company_id:

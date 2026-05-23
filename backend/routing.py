@@ -102,6 +102,9 @@ def route_event(
              .order_by(RoutingRule.priority.asc(), RoutingRule.id.asc())
              .all())
     if not rules:
+        # коммитим auto-created event_type (если такой был), чтобы запись
+        # появилась в каталоге и админ мог создать для неё правило
+        db.session.commit()
         return {"message_ids": [], "skipped_reason": "no_rules"}
 
     # 3) дедуп
@@ -113,6 +116,7 @@ def route_event(
                           Message.created_at >= datetime.utcnow() - timedelta(hours=24))
                   .first())
         if recent:
+            db.session.commit()
             return {"message_ids": [], "skipped_reason": "dedup_sent_recently"}
 
     # 4) для каждого правила — материализуем сообщения
