@@ -5,6 +5,8 @@ import { api } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import ChannelDetailPanel from './ChannelDetailPanel.vue'
 
+const INTRO_KEY = 'mailer_channels_intro_dismissed'
+
 declare const feather: any
 
 defineProps<{
@@ -85,6 +87,12 @@ const selectedChannel = computed(() =>
 )
 function selectKind(k: string | null) { selectedKind.value = k }
 
+const introDismissed = ref(localStorage.getItem(INTRO_KEY) === '1')
+function dismissIntro() {
+  introDismissed.value = true
+  localStorage.setItem(INTRO_KEY, '1')
+}
+
 onMounted(load)
 onUpdated(() => nextTick(() => feather?.replace()))
 </script>
@@ -98,6 +106,33 @@ onUpdated(() => nextTick(() => feather?.replace()))
         :active-tab="activeTab"
         @tab="(id: string) => emit('switch-tab', id)"
       />
+
+      <div v-if="!introDismissed" class="ch-intro">
+        <div class="ch-intro__icon"><i data-feather="send"></i></div>
+        <div class="ch-intro__body">
+          <div class="ch-intro__title">Что такое канал доставки?</div>
+          <div class="ch-intro__text">
+            Канал — способ, которым модули портала отправляют уведомления и
+            письма пользователям. Все доставки идут через mailer-worker, а вы
+            настраиваете каналы централизованно для всей компании.
+          </div>
+          <ul class="ch-intro__list">
+            <li><strong>Email · SMTP</strong> — сервер исходящей почты компании (письма активации, отчёты, восстановление пароля)</li>
+            <li><strong>Telegram · Bot</strong> — бот компании для рассылок в чаты/группы сотрудников</li>
+            <li><strong>Правила</strong> привязывают типы событий (просрочка задачи, новый пользователь, …) к каналу и получателям</li>
+            <li><strong>Журнал</strong> хранит историю всех отправок и входящих сообщений из Telegram</li>
+          </ul>
+          <div class="ch-intro__hint">
+            Модули видят список настроенных каналов через
+            <code>GET /api/mailer/channels</code> и предлагают пользователю
+            доступные способы доставки (например, «Пользователи» — какие
+            методы регистрации показывать).
+          </div>
+        </div>
+        <button class="ch-intro__close" @click="dismissIntro" title="Скрыть">
+          <i data-feather="x"></i>
+        </button>
+      </div>
 
       <div v-if="loading" class="page__empty">Загрузка…</div>
       <div v-else class="page__grid">
@@ -181,6 +216,74 @@ onUpdated(() => nextTick(() => feather?.replace()))
   gap: 14px;
   padding: 18px 32px 32px;
 }
+
+/* Intro hint — клон BranchesPage.branches-intro */
+.ch-intro {
+  display: flex;
+  gap: 14px;
+  padding: 14px 16px;
+  margin: 18px 32px 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  position: relative;
+}
+.ch-intro__icon {
+  flex-shrink: 0;
+  width: 36px; height: 36px;
+  border-radius: 9px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+}
+.ch-intro__icon :deep(svg), .ch-intro__icon i { width: 16px; height: 16px; }
+.ch-intro__body { flex: 1; min-width: 0; }
+.ch-intro__title {
+  font-size: 13px; font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.ch-intro__text {
+  font-size: 12px; color: var(--text-2);
+  line-height: 1.5; margin-bottom: 6px;
+}
+.ch-intro__list {
+  margin: 0 0 6px;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+.ch-intro__list strong { color: var(--text); font-weight: 600; }
+.ch-intro__hint {
+  font-size: 11px; color: var(--text-3);
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.ch-intro__hint code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text);
+}
+.ch-intro__close {
+  position: absolute;
+  top: 8px; right: 8px;
+  width: 26px; height: 26px;
+  border-radius: 7px;
+  border: 0;
+  background: transparent;
+  color: var(--text-4);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background .12s, color .12s;
+}
+.ch-intro__close :deep(svg), .ch-intro__close i { width: 13px; height: 13px; }
+.ch-intro__close:hover { background: var(--hover-bg); color: var(--text); }
 
 .ch-card {
   background: var(--surface);

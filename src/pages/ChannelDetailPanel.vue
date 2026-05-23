@@ -92,10 +92,18 @@ async function save() {
     delete cfg.has_bot_token
     if (isEmail.value && newPassword.value) cfg.password = newPassword.value
     if (!isEmail.value && newBotToken.value) cfg.bot_token = newBotToken.value
+    // Автовключение канала, когда есть достаточный конфиг — пользователь
+    // не выбирает is_enabled явно (нет toggle'а), активным считается «настроенным».
+    const sufficient = isEmail.value
+      ? !!(cfg.host && cfg.username && (newPassword.value || draft.value.config?.has_password))
+      : !!(newBotToken.value || draft.value.config?.has_bot_token)
+    // Дефолтный label по виду канала, если пользователь не задавал
+    const label = (draft.value.label || '').trim() ||
+      (isEmail.value ? 'SMTP компании' : 'Бот компании')
     const url = isEmail.value ? '/api/mailer/channels/email' : '/api/mailer/channels/telegram'
     await api.put(url, {
-      is_enabled: draft.value.is_enabled,
-      label: draft.value.label,
+      is_enabled: sufficient,
+      label,
       config: cfg,
     })
     editing.value = false
@@ -184,18 +192,6 @@ function fmtDate(d: string | null): string {
             </span>
           </div>
           <div v-if="channel.last_test_error" class="dp__last-err">{{ channel.last_test_error }}</div>
-        </div>
-      </DrawerSection>
-
-      <!-- Состояние -->
-      <DrawerSection title="Состояние">
-        <DrawerField label="Название канала" v-model="draft.label" :editing="editing"
-                     :placeholder="isEmail ? 'SMTP компании' : 'Бот рассылок'" />
-        <div class="dp__check">
-          <label class="dp__check-label">
-            <input type="checkbox" v-model="draft.is_enabled" :disabled="!editing" />
-            <span>Канал включён — модули-источники получат его в `/api/mailer/channels`</span>
-          </label>
         </div>
       </DrawerSection>
 
