@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted, onUpdated, nextTick } from 'vue'
+import { ref, computed, onMounted, onUpdated, nextTick } from 'vue'
 import { usePortal } from './composables/usePortal'
-import ChannelsPage from './pages/ChannelsPage.vue'
-import GroupsPage from './pages/GroupsPage.vue'
-import RulesPage from './pages/RulesPage.vue'
-import JournalPage from './pages/JournalPage.vue'
+import { api } from './api'
+import ChannelsView from './pages/ChannelsView.vue'
+import GroupsView from './pages/GroupsView.vue'
+import RulesView from './pages/RulesView.vue'
+import JournalView from './pages/JournalView.vue'
 
 declare const feather: any
 
@@ -12,12 +13,24 @@ const { loaded, load, canView } = usePortal()
 type TabKey = 'channels' | 'groups' | 'rules' | 'journal'
 const activeTab = ref<TabKey>('channels')
 
-const tabs: { key: TabKey; label: string }[] = [
-  { key: 'channels', label: 'Каналы' },
-  { key: 'groups',   label: 'Группы' },
-  { key: 'rules',    label: 'Правила' },
-  { key: 'journal',  label: 'Журнал' },
-]
+// Counts per tab (updated by views). Используются как `t.count` в PageHeader.
+const counts = ref<Record<TabKey, number | null>>({
+  channels: null, groups: null, rules: null, journal: null,
+})
+
+const tabs = computed(() => [
+  { id: 'channels', label: 'Каналы',  count: counts.value.channels ?? undefined },
+  { id: 'groups',   label: 'Группы',  count: counts.value.groups   ?? undefined },
+  { id: 'rules',    label: 'Правила', count: counts.value.rules    ?? undefined },
+  { id: 'journal',  label: 'Журнал',  count: counts.value.journal  ?? undefined },
+])
+
+function updateCount(tab: TabKey, n: number) { counts.value[tab] = n }
+function switchTab(id: string) { activeTab.value = id as TabKey }
+
+const activeView = computed(() => ({
+  channels: ChannelsView, groups: GroupsView, rules: RulesView, journal: JournalView,
+}[activeTab.value]))
 
 onMounted(async () => {
   await load()
@@ -27,49 +40,23 @@ onUpdated(() => { nextTick(() => feather?.replace()) })
 </script>
 
 <template>
-  <div class="mod">
-    <div v-if="!loaded" class="mod-loading">Загрузка…</div>
-    <div v-else-if="!canView()" class="mod-denied">Доступ запрещён</div>
-    <template v-else>
-      <nav class="mod__tabs">
-        <button v-for="t in tabs" :key="t.key"
-                :class="['mod__tab', { 'mod__tab--active': activeTab === t.key }]"
-                @click="activeTab = t.key">{{ t.label }}</button>
-      </nav>
-      <div class="mod__content">
-        <ChannelsPage v-if="activeTab === 'channels'" />
-        <GroupsPage   v-else-if="activeTab === 'groups'" />
-        <RulesPage    v-else-if="activeTab === 'rules'" />
-        <JournalPage  v-else-if="activeTab === 'journal'" />
-      </div>
-    </template>
-  </div>
+  <div v-if="!loaded" class="mod-loading">Загрузка…</div>
+  <div v-else-if="!canView()" class="mod-denied">Доступ запрещён</div>
+  <component
+    v-else
+    :is="activeView"
+    :tabs="tabs"
+    :active-tab="activeTab"
+    @switch-tab="switchTab"
+    @count="(n: number) => updateCount(activeTab, n)"
+  />
 </template>
 
 <style scoped>
-.mod { padding: 0 24px 40px; max-width: 1280px; margin: 0 auto; }
-.mod__tabs {
-  display: flex; gap: 4px; padding: 3px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  margin: 18px 0 18px;
-  width: max-content;
-}
-.mod__tab {
-  padding: 8px 18px;
-  border: 0; border-radius: 8px;
-  background: transparent; color: var(--text-3);
-  cursor: pointer; font-size: 13px; font-weight: 500;
-  transition: background .12s, color .12s;
-  font-family: inherit;
-}
-.mod__tab:hover { color: var(--text); }
-.mod__tab--active {
-  background: var(--surface); color: var(--text);
-  box-shadow: 0 1px 3px rgba(0,0,0,.06);
-}
 .mod-loading, .mod-denied {
-  padding: 60px 0; text-align: center; color: var(--text-3);
+  padding: 80px 32px;
+  text-align: center;
+  color: var(--text-4);
+  font-size: 14px;
 }
 </style>
