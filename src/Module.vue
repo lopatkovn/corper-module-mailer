@@ -60,3 +60,24 @@ onUpdated(() => { nextTick(() => feather?.replace()) })
   font-size: 14px;
 }
 </style>
+
+<!-- Non-scoped body baseline: применяет Inter + design tokens на весь iframe-
+     документ (без этого `body` остаётся в browser defaults: serif/system-font,
+     и страница рендерится «не в стиле портала»). Шаблон corper-module-template
+     делает то же. Padding не ставим — каждая страница задаёт свой через
+     PageHeader (24px 32px 0) и page-content. -->
+<style>
+html, body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+*, *::before, *::after { box-sizing: border-box; }
+</style>
