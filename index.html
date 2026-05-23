@@ -1,11 +1,15 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="linen">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CORPER — Служба рассылок</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <!-- Shared portal palette — served from the shell so модуль рендерится в
+       тех же дизайн-токенах, что и /org/structure, /employees и т.д.
+       data-theme на <html> переключается через usePortal() при theme-changed. -->
+  <link rel="stylesheet" href="/portal-shared/themes.css">
   <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
 </head>
 <body>
