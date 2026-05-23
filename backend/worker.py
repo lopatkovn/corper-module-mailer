@@ -79,11 +79,12 @@ else:
 
 def _send_one_message(m: Message) -> None:
     """Отправить одно сообщение из mailer.message. Бросает исключение при ошибке."""
-    if m.channel is None:
+    ch = Channel.query.get(m.channel_id) if m.channel_id else None
+    if ch is None:
         raise RuntimeError("channel пуст — нечем отправлять")
-    cfg = m.channel.config or {}
+    cfg = ch.config or {}
 
-    if m.channel.kind == "email":
+    if ch.kind == "email":
         send_email(
             to_addr=m.to_address,
             subject=m.subject or "(без темы)",
@@ -92,7 +93,7 @@ def _send_one_message(m: Message) -> None:
             smtp_cfg=cfg,
         )
 
-    elif m.channel.kind == "telegram":
+    elif ch.kind == "telegram":
         bot_token = cfg.get("bot_token")
         if not bot_token:
             raise RuntimeError("bot_token не задан в channel.config")
@@ -100,13 +101,13 @@ def _send_one_message(m: Message) -> None:
             chat_id = int(m.to_address)
         except (TypeError, ValueError):
             chat_id = m.to_address
-        if not _rl.try_send(m.channel.id, int(chat_id) if isinstance(chat_id, int) else 0):
+        if not _rl.try_send(ch.id, int(chat_id) if isinstance(chat_id, int) else 0):
             raise RuntimeError("rate_limited")  # worker оставит pending → ретрай
         res = tg_send(bot_token, chat_id, m.body_text or "")
         # сохраним telegram_message_id в payload для будущей reply-связки
         m.payload = {**(m.payload or {}), "telegram_message_id": res.get("message_id")}
     else:
-        raise RuntimeError(f"неизвестный kind={m.channel.kind!r}")
+        raise RuntimeError(f"неизвестный kind={ch.kind!r}")
 
 
 def _process_pending_mailer_messages() -> None:
@@ -123,12 +124,14 @@ def _process_pending_mailer_messages() -> None:
             m.sent_at = datetime.utcnow()
             m.last_error = None
             # для test-каналов — обновим last_test_at/ok
-            if m.event_type in ("_test.email", "_test.telegram") and m.channel is not None:
-                m.channel.last_test_at = datetime.utcnow()
-                m.channel.last_test_ok = True
-                m.channel.last_test_error = None
+            ch = Channel.query.get(m.channel_id) if m.channel_id else None
+            if m.event_type in ("_test.email", "_test.telegram") and ch is not None:
+                ch.last_test_at = datetime.utcnow()
+                ch.last_test_ok = True
+                ch.last_test_error = None
             db.session.commit()
-            log.info("sent message id=%s to=%s kind=%s", m.id, m.to_address, m.channel.kind)
+            log.info("sent message id=%s to=%s kind=%s", m.id, m.to_address,
+                     ch.kind if ch else "?")
         except Exception as e:
             err = str(e)
             m.attempts = (m.attempts or 0) + 1
@@ -141,10 +144,12 @@ def _process_pending_mailer_messages() -> None:
                 m.status = "failed"
             else:
                 m.status = "pending"
-            if m.event_type in ("_test.email", "_test.telegram") and m.channel is not None and m.status == "failed":
-                m.channel.last_test_at = datetime.utcnow()
-                m.channel.last_test_ok = False
-                m.channel.last_test_error = err
+            ch = Channel.query.get(m.channel_id) if m.channel_id else None
+            if (m.event_type in ("_test.email", "_test.telegram")
+                    and ch is not None and m.status == "failed"):
+                ch.last_test_at = datetime.utcnow()
+                ch.last_test_ok = False
+                ch.last_test_error = err
             db.session.commit()
             log.warning("send failed id=%s attempts=%s err=%s", m.id, m.attempts, err)
 
