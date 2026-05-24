@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUpdated, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUpdated, nextTick, onUnmounted } from 'vue'
 import { usePortal } from '../composables/usePortal'
 import { api } from '../api'
 import DrawerSection from '../components/DrawerSection.vue'
@@ -8,76 +8,90 @@ import GhostBtn from '../components/GhostBtn.vue'
 declare const feather: any
 
 interface EventType { id: number; key: string; label: string; source_module: string }
-interface ChannelMini { id: number; kind: string; label: string }
-interface Group { id: number; chat_id: number; title: string }
+interface Group { id: number; chat_id: number; title: string; is_forum: boolean }
+interface Topic { id: number; telegram_thread_id: number; name: string }
 interface Rule {
-  id: number; event_type_id: number; channel_id: number;
-  recipients: any; is_enabled: boolean; priority: number
+  id: number
+  event_type_id: number
+  branch_id: number | null
+  telegram_group_id: number
+  topic_id: number | null
+  is_enabled: boolean
+  priority: number
 }
 
 const props = defineProps<{
   rule: Rule | null
   isNew: boolean
   eventTypes: EventType[]
-  channels: ChannelMini[]
   groups: Group[]
+  topicsByGroup: Record<number, Topic[]>
   canManage: boolean
 }>()
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'saved', rule: Rule): void
   (e: 'deleted'): void
+  (e: 'topics-reloaded'): void
 }>()
 
-const { branches, employees } = usePortal()
+const { branches } = usePortal()
 
-// Draft
 const draft = ref<Rule>({
-  id: 0, event_type_id: 0, channel_id: 0,
-  recipients: { emails: [], employee_ids: [], branch_ids: [], telegram_group_ids: [] },
-  is_enabled: true, priority: 100,
+  id: 0,
+  event_type_id: 0,
+  branch_id: null,
+  telegram_group_id: 0,
+  topic_id: null,
+  is_enabled: true,
+  priority: 100,
 })
 const editing = ref(false)
 const saving = ref(false)
 const error = ref('')
-const newEmail = ref('')
 const confirmDelete = ref(false)
+
+// Topic-wizard state
+const wizardOpen = ref(false)
+const wizardName = ref('')
+const wizardPhrase = ref('')
+const wizardRegId = ref<number | null>(null)
+const wizardExpires = ref<string | null>(null)
+const wizardError = ref('')
+const wizardGenerating = ref(false)
+let wizardPollTimer: ReturnType<typeof setInterval> | null = null
 
 watch(() => [props.rule, props.isNew], () => {
   if (props.isNew) {
     draft.value = {
       id: 0,
       event_type_id: props.eventTypes[0]?.id || 0,
-      channel_id: props.channels[0]?.id || 0,
-      recipients: { emails: [], employee_ids: [], branch_ids: [], telegram_group_ids: [] },
-      is_enabled: true, priority: 100,
+      branch_id: null,
+      telegram_group_id: props.groups[0]?.id || 0,
+      topic_id: null,
+      is_enabled: true,
+      priority: 100,
     }
     editing.value = true
   } else if (props.rule) {
-    draft.value = {
-      ...props.rule,
-      recipients: {
-        emails: props.rule.recipients?.emails ?? [],
-        employee_ids: props.rule.recipients?.employee_ids ?? [],
-        branch_ids: props.rule.recipients?.branch_ids ?? [],
-        telegram_group_ids: props.rule.recipients?.telegram_group_ids ?? [],
-      },
-    }
+    draft.value = { ...props.rule }
     editing.value = false
   }
   error.value = ''
-  newEmail.value = ''
   confirmDelete.value = false
+  closeWizard()
 }, { immediate: true, deep: true })
 
 onMounted(() => nextTick(() => feather?.replace()))
 onUpdated(() => nextTick(() => feather?.replace()))
+onUnmounted(() => { if (wizardPollTimer) clearInterval(wizardPollTimer) })
 
-const eventTypeLabel = computed(() => props.eventTypes.find(e => e.id === draft.value.event_type_id)?.label || '')
 const eventTypeKey = computed(() => props.eventTypes.find(e => e.id === draft.value.event_type_id)?.key || '')
+const eventTypeLabel = computed(() => props.eventTypes.find(e => e.id === draft.value.event_type_id)?.label || '')
 const eventTypeSource = computed(() => props.eventTypes.find(e => e.id === draft.value.event_type_id)?.source_module || '')
-const selectedChannel = computed(() => props.channels.find(c => c.id === draft.value.channel_id))
-const channelKind = computed(() => selectedChannel.value?.kind || '')
+
+const selectedGroup = computed(() => props.groups.find(g => g.id === draft.value.telegram_group_id))
+const topicsForGroup = computed(() => props.topicsByGroup[draft.value.telegram_group_id] || [])
 
 function startEdit() {
   if (!props.canManage) return
@@ -85,38 +99,33 @@ function startEdit() {
   error.value = ''
 }
 function cancelEdit() {
-  if (props.isNew) {
-    emit('close')
-    return
-  }
-  if (props.rule) {
-    draft.value = {
-      ...props.rule,
-      recipients: {
-        emails: props.rule.recipients?.emails ?? [],
-        employee_ids: props.rule.recipients?.employee_ids ?? [],
-        branch_ids: props.rule.recipients?.branch_ids ?? [],
-        telegram_group_ids: props.rule.recipients?.telegram_group_ids ?? [],
-      },
-    }
-  }
+  if (props.isNew) { emit('close'); return }
+  if (props.rule) draft.value = { ...props.rule }
   editing.value = false
   error.value = ''
 }
 
 async function save() {
-  if (!draft.value.event_type_id || !draft.value.channel_id) {
-    error.value = 'Выберите событие и канал'
+  if (!draft.value.event_type_id || !draft.value.telegram_group_id) {
+    error.value = 'Выберите событие и группу'
     return
   }
   saving.value = true
   error.value = ''
   try {
+    const payload = {
+      event_type_id: draft.value.event_type_id,
+      branch_id: draft.value.branch_id,
+      telegram_group_id: draft.value.telegram_group_id,
+      topic_id: draft.value.topic_id,
+      is_enabled: draft.value.is_enabled,
+      priority: draft.value.priority,
+    }
     let result: Rule
     if (props.isNew) {
-      result = await api.post('/api/mailer/rules', draft.value).then(r => r.data)
+      result = await api.post('/api/mailer/rules', payload).then(r => r.data)
     } else {
-      result = await api.put(`/api/mailer/rules/${draft.value.id}`, draft.value).then(r => r.data)
+      result = await api.put(`/api/mailer/rules/${draft.value.id}`, payload).then(r => r.data)
     }
     emit('saved', result)
   } catch (e: any) {
@@ -147,40 +156,60 @@ async function toggleEnabled() {
   }
 }
 
-// Recipients editors
-function addEmail() {
-  if (!newEmail.value.includes('@')) return
-  draft.value.recipients.emails = [...(draft.value.recipients.emails || []), newEmail.value.trim()]
-  newEmail.value = ''
+// ── Topic wizard ──
+function openWizard() {
+  if (!draft.value.telegram_group_id) return
+  wizardOpen.value = true
+  wizardName.value = ''
+  wizardPhrase.value = ''
+  wizardRegId.value = null
+  wizardExpires.value = null
+  wizardError.value = ''
 }
-function removeEmail(i: number) {
-  draft.value.recipients.emails!.splice(i, 1)
-}
-function toggleEmployee(id: number) {
-  const arr = draft.value.recipients.employee_ids = draft.value.recipients.employee_ids || []
-  const i = arr.indexOf(id); i >= 0 ? arr.splice(i, 1) : arr.push(id)
-}
-function toggleBranch(id: number) {
-  const arr = draft.value.recipients.branch_ids = draft.value.recipients.branch_ids || []
-  const i = arr.indexOf(id); i >= 0 ? arr.splice(i, 1) : arr.push(id)
-}
-function toggleGroup(id: number) {
-  const arr = draft.value.recipients.telegram_group_ids = draft.value.recipients.telegram_group_ids || []
-  const i = arr.indexOf(id); i >= 0 ? arr.splice(i, 1) : arr.push(id)
+function closeWizard() {
+  wizardOpen.value = false
+  if (wizardPollTimer) { clearInterval(wizardPollTimer); wizardPollTimer = null }
 }
 
-function fmt(arr: any[] | undefined, fn: (x: any) => string): string {
-  if (!arr || !arr.length) return ''
-  return arr.map(fn).join(', ')
+async function generatePhrase() {
+  wizardGenerating.value = true
+  wizardError.value = ''
+  try {
+    const res = await api.post(
+      `/api/mailer/groups/${draft.value.telegram_group_id}/topic-registrations`,
+      { name: wizardName.value.trim() || undefined }
+    ).then(r => r.data)
+    wizardPhrase.value = res.phrase
+    wizardRegId.value = res.id
+    wizardExpires.value = res.expires_at
+    if (wizardPollTimer) clearInterval(wizardPollTimer)
+    wizardPollTimer = setInterval(pollRegistration, 3000)
+  } catch (e: any) {
+    wizardError.value = e?.response?.data?.error || e.message
+  } finally { wizardGenerating.value = false }
 }
-function employeeName(id: number): string {
-  return employees.value.find(e => e.id === id)?.name || `#${id}`
+
+async function pollRegistration() {
+  if (!wizardRegId.value) return
+  try {
+    const res = await api.get(`/api/mailer/topic-registrations/${wizardRegId.value}`).then(r => r.data)
+    if (res.consumed_at && res.topic?.id) {
+      emit('topics-reloaded')
+      draft.value.topic_id = res.topic.id
+      closeWizard()
+    } else if (res.expires_at && new Date(res.expires_at) < new Date()) {
+      wizardError.value = 'Фраза просрочена. Попробуйте ещё раз.'
+      if (wizardPollTimer) { clearInterval(wizardPollTimer); wizardPollTimer = null }
+    }
+  } catch {
+    // ignore transient
+  }
 }
-function branchName(id: number): string {
-  return branches.value.find(b => b.id === id)?.name || `#${id}`
-}
-function groupTitle(id: number): string {
-  return props.groups.find(g => g.id === id)?.title || `#${id}`
+
+async function copyPhrase() {
+  try {
+    await navigator.clipboard.writeText(wizardPhrase.value)
+  } catch { /* ignore */ }
 }
 </script>
 
@@ -232,89 +261,75 @@ function groupTitle(id: number): string {
         </div>
       </DrawerSection>
 
-      <!-- CHANNEL -->
-      <DrawerSection title="Канал доставки">
+      <!-- BRANCH FILTER -->
+      <DrawerSection title="Фильтр по филиалу">
         <div class="dp__field" v-if="editing">
-          <select class="drawer-field__input" v-model="draft.channel_id">
-            <option :value="0" disabled>— выберите канал —</option>
-            <option v-for="c in channels" :key="c.id" :value="c.id">
-              {{ c.kind === 'email' ? '✉ Email' : '✈ Telegram' }} — {{ c.label || c.kind }}
-            </option>
+          <select class="drawer-field__input" :value="draft.branch_id ?? ''"
+                  @change="draft.branch_id = ($event.target as HTMLSelectElement).value ? Number(($event.target as HTMLSelectElement).value) : null">
+            <option value="">Любой филиал</option>
+            <option v-for="b in branches" :key="b.id" :value="b.id">{{ b.name }}</option>
           </select>
+          <div class="drawer-field__hint">
+            Если задан — событие сматчится только когда <code>branch_id</code> в payload совпадёт с этим филиалом
+            (либо когда в payload нет <code>branch_id</code> и в правиле <code>branch_id</code>=null).
+          </div>
         </div>
-        <div v-else class="dp__channel-row">
-          <i :data-feather="channelKind === 'email' ? 'mail' : 'send'" class="dp__channel-icon"></i>
-          <span>{{ selectedChannel?.label || (channelKind === 'email' ? 'Email' : 'Telegram') }}</span>
+        <div v-else>
+          <div class="dp__value" v-if="draft.branch_id">
+            {{ branches.find(b => b.id === draft.branch_id)?.name || `#${draft.branch_id}` }}
+          </div>
+          <div class="dp__muted" v-else>любой филиал</div>
         </div>
       </DrawerSection>
 
-      <!-- RECIPIENTS -->
-      <DrawerSection title="Получатели">
-        <!-- Email channel recipients -->
-        <template v-if="channelKind === 'email'">
-          <div class="dp__sub">Прямые email-адреса</div>
-          <div class="dp__chips">
-            <span v-for="(e, i) in draft.recipients.emails" :key="i" class="dp__chip">
-              {{ e }}
-              <button v-if="editing" type="button" @click="removeEmail(i)" class="dp__chip-x">×</button>
-            </span>
-            <div v-if="!draft.recipients.emails?.length && !editing" class="dp__empty-line">не указаны</div>
+      <!-- TG GROUP -->
+      <DrawerSection title="Telegram-группа">
+        <div class="dp__field" v-if="editing">
+          <select class="drawer-field__input" v-model="draft.telegram_group_id"
+                  @change="draft.topic_id = null">
+            <option :value="0" disabled>— выберите группу —</option>
+            <option v-for="g in groups" :key="g.id" :value="g.id">
+              {{ g.title || `chat ${g.chat_id}` }}
+            </option>
+          </select>
+        </div>
+        <div v-else>
+          <div class="dp__channel-row">
+            <i data-feather="message-square" class="dp__channel-icon"></i>
+            <span>{{ selectedGroup?.title || (selectedGroup ? `chat ${selectedGroup.chat_id}` : '—') }}</span>
           </div>
-          <div v-if="editing" class="dp__chip-add">
-            <input class="drawer-field__input drawer-field__input--mono"
-                   v-model="newEmail" placeholder="email@example.com"
-                   @keyup.enter.prevent="addEmail" />
-            <GhostBtn @click="addEmail">Добавить</GhostBtn>
-          </div>
+        </div>
+      </DrawerSection>
 
-          <div class="dp__sub">Сотрудники (по email)</div>
-          <div v-if="editing" class="dp__picker">
-            <label v-for="e in employees" :key="e.id" class="dp__picker-item">
-              <input type="checkbox"
-                     :checked="draft.recipients.employee_ids?.includes(e.id)"
-                     @change="toggleEmployee(e.id)" />
-              <span>{{ e.name }} <small>{{ e.email || '—' }}</small></span>
-            </label>
-            <div v-if="!employees.length" class="dp__empty-line">Нет сотрудников</div>
-          </div>
-          <div v-else class="dp__inline-list">
-            {{ draft.recipients.employee_ids?.length ? fmt(draft.recipients.employee_ids, employeeName) : 'не указаны' }}
-          </div>
-
-          <div class="dp__sub">Филиалы (все сотрудники филиала)</div>
-          <div v-if="editing" class="dp__chip-row">
-            <label v-for="b in branches" :key="b.id" class="dp__chip-toggle">
-              <input type="checkbox"
-                     :checked="draft.recipients.branch_ids?.includes(b.id)"
-                     @change="toggleBranch(b.id)" />
-              <span>{{ b.name }}</span>
-            </label>
-          </div>
-          <div v-else class="dp__inline-list">
-            {{ draft.recipients.branch_ids?.length ? fmt(draft.recipients.branch_ids, branchName) : 'не указаны' }}
-          </div>
+      <!-- TOPIC -->
+      <DrawerSection title="Топик в группе">
+        <template #action v-if="editing && draft.telegram_group_id">
+          <button class="dp__inline-btn" @click="openWizard">
+            <i data-feather="plus"></i>
+            <span>Привязать новый</span>
+          </button>
         </template>
-
-        <!-- Telegram channel recipients -->
-        <template v-else-if="channelKind === 'telegram'">
-          <div class="dp__sub">Telegram-группы</div>
-          <div v-if="editing" class="dp__chip-row">
-            <label v-for="g in groups" :key="g.id" class="dp__chip-toggle">
-              <input type="checkbox"
-                     :checked="draft.recipients.telegram_group_ids?.includes(g.id)"
-                     @change="toggleGroup(g.id)" />
-              <span>{{ g.title || `chat_id=${g.chat_id}` }}</span>
-            </label>
-            <div v-if="!groups.length" class="dp__empty-line">
-              Нет групп. Добавьте на вкладке «Группы».
-            </div>
+        <div class="dp__field" v-if="editing">
+          <select class="drawer-field__input" :value="draft.topic_id ?? ''"
+                  @change="draft.topic_id = ($event.target as HTMLSelectElement).value ? Number(($event.target as HTMLSelectElement).value) : null">
+            <option value="">Общий чат (без топика)</option>
+            <option v-for="t in topicsForGroup" :key="t.id" :value="t.id">
+              {{ t.name }}
+            </option>
+          </select>
+          <div class="drawer-field__hint" v-if="!topicsForGroup.length">
+            У этой группы пока нет зарегистрированных топиков. Нажмите
+            «Привязать новый» — мы сгенерируем фразу, вы вставите её
+            в нужный форум-топик, бот распознает и зарегистрирует.
           </div>
-          <div v-else class="dp__inline-list">
-            {{ draft.recipients.telegram_group_ids?.length ? fmt(draft.recipients.telegram_group_ids, groupTitle) : 'не указаны' }}
+        </div>
+        <div v-else>
+          <div v-if="draft.topic_id" class="dp__value">
+            <i data-feather="hash" class="dp__inline-icon"></i>
+            {{ topicsForGroup.find(t => t.id === draft.topic_id)?.name || `#${draft.topic_id}` }}
           </div>
-        </template>
-
-        <div v-else class="drawer-field__hint">Выберите канал, чтобы указать получателей.</div>
+          <div v-else class="dp__muted">общий чат (без топика)</div>
+        </div>
       </DrawerSection>
 
       <!-- Settings -->
@@ -324,7 +339,7 @@ function groupTitle(id: number): string {
           <input v-if="editing" class="drawer-field__input drawer-field__input--mono"
                  type="number" v-model.number="draft.priority" />
           <div v-else class="drawer-field__value drawer-field__value--mono">{{ draft.priority }}</div>
-          <div class="drawer-field__hint">Меньше = выше. При нескольких правилах применяются по возрастанию.</div>
+          <div class="drawer-field__hint">Меньше = выше. Правила применяются по возрастанию.</div>
         </div>
 
         <div class="dp__check" v-if="editing">
@@ -359,6 +374,54 @@ function groupTitle(id: number): string {
           {{ confirmDelete ? 'Подтвердите ещё раз' : 'Удалить правило' }}
         </GhostBtn>
       </DrawerSection>
+    </div>
+
+    <!-- Topic wizard modal -->
+    <div v-if="wizardOpen" class="modal-bg" @click.self="closeWizard">
+      <div class="modal">
+        <h3 class="modal__title">Привязать новый топик</h3>
+
+        <template v-if="!wizardPhrase">
+          <div class="drawer-field">
+            <label class="drawer-field__label">Название топика (опц.)</label>
+            <input class="drawer-field__input" v-model="wizardName"
+                   placeholder="Например, «Поддержка»" />
+            <div class="drawer-field__hint">
+              Можно оставить пустым — бот возьмёт «Топик #N».
+            </div>
+          </div>
+          <p v-if="wizardError" class="modal__err">{{ wizardError }}</p>
+          <div class="modal__actions">
+            <GhostBtn @click="closeWizard">Отмена</GhostBtn>
+            <button class="dp__primary" :disabled="wizardGenerating" @click="generatePhrase">
+              {{ wizardGenerating ? 'Генерирую…' : 'Сгенерировать фразу' }}
+            </button>
+          </div>
+        </template>
+
+        <template v-else>
+          <div class="modal__step">Шаг 1 — копируем фразу:</div>
+          <div class="modal__phrase">
+            <code>{{ wizardPhrase }}</code>
+            <button class="modal__copy" @click="copyPhrase" title="Скопировать">
+              <i data-feather="copy"></i>
+            </button>
+          </div>
+          <div class="modal__step">Шаг 2 — открываем нужный форум-топик в Telegram и вставляем эту фразу сообщением:</div>
+          <div class="modal__hint">
+            Бот увидит сообщение с фразой → закрепит этот топик за рассылками →
+            это окно закроется автоматически, топик станет выбранным.
+          </div>
+          <div class="modal__waiting">
+            <i data-feather="loader" class="modal__spin"></i>
+            <span>Ждём бота…</span>
+          </div>
+          <p v-if="wizardError" class="modal__err">{{ wizardError }}</p>
+          <div class="modal__actions">
+            <GhostBtn @click="closeWizard">Отмена</GhostBtn>
+          </div>
+        </template>
+      </div>
     </div>
   </aside>
 </template>
@@ -398,56 +461,22 @@ function groupTitle(id: number): string {
 }
 
 .dp__field { display: flex; flex-direction: column; gap: 6px; }
-.dp__value { font-size: 14px; color: var(--text); font-weight: 500; }
+.dp__value { font-size: 14px; color: var(--text); font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
 .dp__key { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-4); margin-top: -2px; }
+.dp__muted { color: var(--placeholder); font-size: 13px; }
 .dp__channel-row { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); }
 .dp__channel-row :deep(svg) { width: 16px; height: 16px; color: var(--accent); }
+.dp__inline-icon { width: 14px; height: 14px; color: var(--text-4); }
+.dp__inline-icon :deep(svg) { width: 14px; height: 14px; }
 
-.dp__sub {
-  font-size: 11px; color: var(--text-3); font-weight: 500;
-  margin-top: 8px;
+.dp__inline-btn {
+  border: 0; background: transparent; color: var(--accent);
+  font-size: 12px; cursor: pointer; padding: 2px 6px;
+  display: inline-flex; align-items: center; gap: 4px; font-family: inherit;
 }
-.dp__sub:first-child { margin-top: 0; }
-.dp__chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.dp__chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  padding: 4px 10px; border-radius: 999px;
-  background: var(--panel); border: 1px solid var(--border);
-  font-size: 12px; color: var(--text);
-}
-.dp__chip-x {
-  background: 0; border: 0; color: var(--text-3); cursor: pointer;
-  font-size: 14px; padding: 0 2px;
-}
-.dp__chip-add { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
-.dp__chip-add input { flex: 1; min-width: 0; }
-
-.dp__picker {
-  max-height: 220px; overflow-y: auto;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-  padding: 6px;
-}
-.dp__picker-item {
-  display: flex; align-items: center; gap: 8px; padding: 5px 6px;
-  font-size: 13px; color: var(--text); cursor: pointer; border-radius: 6px;
-}
-.dp__picker-item:hover { background: var(--hover-bg); }
-.dp__picker-item small { color: var(--text-4); font-size: 11px; }
-.dp__picker-item input { accent-color: var(--accent); }
-.dp__chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.dp__chip-toggle {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 5px 10px; border-radius: 999px;
-  border: 1px solid var(--border); background: var(--surface);
-  cursor: pointer; font-size: 12px; color: var(--text);
-  user-select: none;
-}
-.dp__chip-toggle:has(input:checked) {
-  border-color: var(--accent); background: var(--ring); color: var(--text);
-}
-.dp__chip-toggle input { accent-color: var(--accent); }
-.dp__empty-line { font-size: 12px; color: var(--placeholder); }
-.dp__inline-list { font-size: 13px; color: var(--text-2); word-break: break-word; }
+.dp__inline-btn:disabled { opacity: .55; cursor: not-allowed; }
+.dp__inline-btn:hover:not(:disabled) { text-decoration: underline; }
+.dp__inline-btn :deep(svg) { width: 12px; height: 12px; }
 
 .dp__check-label {
   display: flex; align-items: center; gap: 8px;
@@ -512,4 +541,49 @@ function groupTitle(id: number): string {
 .drawer-field__label { font-size: 10px; font-weight: 500; letter-spacing: .16em; text-transform: uppercase; color: var(--text-4); font-family: 'JetBrains Mono', monospace; }
 .drawer-field__value { font-size: 13px; color: var(--text); }
 .drawer-field__value--mono { font-family: 'JetBrains Mono', monospace; }
+
+/* Topic wizard modal */
+.modal-bg {
+  position: fixed; inset: 0; background: rgba(0,0,0,.35);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+}
+.modal {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 22px; min-width: 420px; max-width: 520px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.16);
+}
+.modal__title { margin: 0 0 14px; font-size: 16px; font-weight: 600; color: var(--text); }
+.modal__step { font-size: 12px; color: var(--text-3); margin-top: 12px; margin-bottom: 6px; }
+.modal__step:first-child { margin-top: 0; }
+.modal__phrase {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 14px;
+  background: var(--panel); border: 1px dashed var(--border-strong); border-radius: 9px;
+  font-family: 'JetBrains Mono', monospace; font-size: 14px;
+  color: var(--text); font-weight: 600;
+}
+.modal__phrase code { flex: 1; user-select: all; }
+.modal__copy {
+  width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--surface); color: var(--text-2); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal__copy:hover { background: var(--hover-bg); color: var(--text); }
+.modal__copy :deep(svg) { width: 14px; height: 14px; }
+.modal__hint { font-size: 12px; color: var(--text-3); line-height: 1.5; margin: 8px 0 12px; }
+.modal__waiting {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px;
+  background: var(--panel); border-radius: 8px;
+  font-size: 12px; color: var(--text-2);
+}
+.modal__waiting :deep(svg) { width: 14px; height: 14px; }
+.modal__spin :deep(svg) { animation: spin 1.2s linear infinite; }
+@keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+.modal__err {
+  margin: 12px 0 0; padding: 8px 12px;
+  background: #fbe8e7; border: 1px solid #f3c5c2; border-radius: 8px;
+  color: #b3261e; font-size: 12px;
+}
+.modal__actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
 </style>

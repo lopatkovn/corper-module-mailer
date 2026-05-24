@@ -144,6 +144,69 @@ async function checkBot() {
   } finally { botChecking.value = false }
 }
 
+// ── Bot branding ─────────────────────────────────────────────────────────
+interface BrandingCommand { command: string; description: string }
+const branding = ref({ name: '', description: '', short_description: '', commands_text: '' })
+const brandingLoaded = ref(false)
+const brandingLoading = ref(false)
+const brandingSaving = ref(false)
+const brandingResult = ref<string | null>(null)
+
+function _commandsToText(cmds: BrandingCommand[]): string {
+  return (cmds || []).map(c => `${c.command}: ${c.description}`).join('\n')
+}
+function _textToCommands(text: string): BrandingCommand[] {
+  const out: BrandingCommand[] = []
+  for (const line of (text || '').split('\n')) {
+    const t = line.trim()
+    if (!t) continue
+    const idx = t.indexOf(':')
+    if (idx < 1) continue
+    const cmd = t.slice(0, idx).trim().replace(/^\//, '')
+    const desc = t.slice(idx + 1).trim()
+    if (cmd && desc) out.push({ command: cmd, description: desc })
+  }
+  return out
+}
+
+async function loadBranding() {
+  if (brandingLoaded.value) return
+  brandingLoading.value = true
+  try {
+    const d = await api.get('/api/mailer/bot/branding').then(r => r.data)
+    branding.value = {
+      name: d.name || '',
+      description: d.description || '',
+      short_description: d.short_description || '',
+      commands_text: _commandsToText(d.commands || []),
+    }
+    brandingLoaded.value = true
+  } catch (e: any) {
+    brandingResult.value = 'Не удалось загрузить: ' + (e?.response?.data?.error || e?.message || e)
+  } finally { brandingLoading.value = false }
+}
+
+async function saveBranding() {
+  brandingSaving.value = true
+  brandingResult.value = null
+  try {
+    const body = {
+      name: branding.value.name,
+      description: branding.value.description,
+      short_description: branding.value.short_description,
+      commands: _textToCommands(branding.value.commands_text),
+    }
+    const res = await api.put('/api/mailer/bot/branding', body).then(r => r.data)
+    if (res.ok) {
+      brandingResult.value = `Применено: ${(res.applied || []).join(', ')}`
+    } else {
+      brandingResult.value = `Частично: ${(res.applied || []).join(', ')}; ошибки: ${(res.errors || []).join('; ')}`
+    }
+  } catch (e: any) {
+    brandingResult.value = 'Ошибка: ' + (e?.response?.data?.error || e?.message || e)
+  } finally { brandingSaving.value = false }
+}
+
 function fmtDate(d: string | null): string {
   return d ? new Date(d).toLocaleString('ru-RU') : '—'
 }
@@ -273,6 +336,63 @@ function fmtDate(d: string | null): string {
             После проверки добавьте бота в Telegram-чат (как админ с правом писать) — чат появится
             на вкладке «Группы» автоматически.
           </div>
+        </DrawerSection>
+
+        <!-- Бот-брендинг — only for telegram, после bot/check -->
+        <DrawerSection v-if="canManage && draft.config.has_bot_token && !editing"
+                       title="Брендинг бота">
+          <template #action>
+            <button class="dp__inline-btn" :disabled="brandingLoading" @click="loadBranding">
+              <i :data-feather="brandingLoaded ? 'refresh-cw' : 'download'"></i>
+              <span>{{ brandingLoading ? 'Загружаю…' : (brandingLoaded ? 'Перечитать' : 'Подтянуть текущие') }}</span>
+            </button>
+          </template>
+
+          <template v-if="!brandingLoaded">
+            <div class="drawer-field__hint">
+              Нажмите «Подтянуть текущие», чтобы получить от Telegram имя/описание/команды
+              бота — отредактируете и отправите назад одной кнопкой.
+            </div>
+            <p v-if="brandingResult" class="dp__inline-result">{{ brandingResult }}</p>
+          </template>
+
+          <template v-else>
+            <div class="drawer-field">
+              <label class="drawer-field__label">Имя бота (setMyName, ≤64)</label>
+              <input class="drawer-field__input" v-model="branding.name" maxlength="64" />
+            </div>
+            <div class="drawer-field">
+              <label class="drawer-field__label">Короткое описание (setMyShortDescription, ≤120)</label>
+              <input class="drawer-field__input" v-model="branding.short_description" maxlength="120" />
+              <div class="drawer-field__hint">Показывается в карточке бота в Telegram.</div>
+            </div>
+            <div class="drawer-field">
+              <label class="drawer-field__label">Описание (setMyDescription, ≤512)</label>
+              <textarea class="drawer-field__input" v-model="branding.description" rows="3" maxlength="512"></textarea>
+              <div class="drawer-field__hint">Видно на экране /start у пользователя.</div>
+            </div>
+            <div class="drawer-field">
+              <label class="drawer-field__label">Команды (setMyCommands)</label>
+              <textarea class="drawer-field__input drawer-field__input--mono" v-model="branding.commands_text" rows="4"
+                        placeholder="start: Запустить бота
+status: Статус подключения
+help: Справка"></textarea>
+              <div class="drawer-field__hint">
+                По одной команде на строку, формат <code>команда: описание</code>.
+                Слэш в начале не нужен. Очистка списка = пустое поле.
+              </div>
+            </div>
+            <div class="drawer-field__hint">
+              ⚠ Аватарка бота меняется только через @BotFather (Bot API не поддерживает setMyPhoto).
+            </div>
+            <p v-if="brandingResult" class="dp__inline-result">{{ brandingResult }}</p>
+            <div class="dp__footer">
+              <button class="dp__primary" :disabled="brandingSaving" @click="saveBranding">
+                <i data-feather="send"></i>
+                {{ brandingSaving ? 'Отправляю…' : 'Применить в Telegram' }}
+              </button>
+            </div>
+          </template>
         </DrawerSection>
       </template>
 

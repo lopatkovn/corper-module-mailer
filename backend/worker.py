@@ -33,7 +33,10 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 import app as backend_app  # noqa: E402  — ре-юзаем Flask app + db из backend
-from models import Channel, TelegramGroup, Message, PollState  # noqa: E402
+from models import (  # noqa: E402
+    Channel, TelegramGroup, TelegramTopic, TopicRegistration,
+    Message, PollState,
+)
 
 from corper_shared.service_client import CoreClient  # noqa: E402
 
@@ -103,7 +106,10 @@ def _send_one_message(m: Message) -> None:
             chat_id = m.to_address
         if not _rl.try_send(ch.id, int(chat_id) if isinstance(chat_id, int) else 0):
             raise RuntimeError("rate_limited")  # worker оставит pending → ретрай
-        res = tg_send(bot_token, chat_id, m.body_text or "")
+        # message_thread_id берётся из payload (положили в routing/deliver)
+        thread_id = (m.payload or {}).get("message_thread_id")
+        res = tg_send(bot_token, chat_id, m.body_text or "",
+                      message_thread_id=thread_id)
         # сохраним telegram_message_id в payload для будущей reply-связки
         m.payload = {**(m.payload or {}), "telegram_message_id": res.get("message_id")}
     else:
@@ -316,6 +322,58 @@ def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
 
     from_user = msg.get("from") or {}
     text = msg.get("text") or msg.get("caption")
+    thread_id = msg.get("message_thread_id")   # есть только в форум-топиках
+
+    # ── Topic-registration: матчим pending-фразу в форум-топике ──────────
+    # Если сообщение пришло из форум-топика и текст содержит активную
+    # seed-фразу — закрепляем (group_id, thread_id, name) и отвечаем
+    # подтверждением в этот же топик.
+    if thread_id and text:
+        group = TelegramGroup.query.filter_by(
+            company_id=ch.company_id, chat_id=int(chat_id)).first()
+        if group is not None:
+            # пометим группу как форум (раз тут пришёл thread_id)
+            if not group.is_forum:
+                group.is_forum = True
+            pending_list = (TopicRegistration.query
+                            .filter(TopicRegistration.consumed_at.is_(None),
+                                    TopicRegistration.expires_at > datetime.utcnow(),
+                                    TopicRegistration.group_id == group.id)
+                            .all())
+            for p in pending_list:
+                if p.phrase and p.phrase in text:
+                    topic = (TelegramTopic.query
+                             .filter_by(group_id=group.id,
+                                        telegram_thread_id=int(thread_id))
+                             .first())
+                    if topic is None:
+                        topic = TelegramTopic(
+                            company_id=ch.company_id, group_id=group.id,
+                            telegram_thread_id=int(thread_id),
+                            name=p.name or f"Топик #{thread_id}",
+                        )
+                        db.session.add(topic)
+                        db.session.flush()
+                    else:
+                        if p.name:
+                            topic.name = p.name
+                        if topic.archived_at:
+                            topic.archived_at = None
+                    p.consumed_at = datetime.utcnow()
+                    p.topic_id = topic.id
+                    db.session.commit()
+                    # отвечаем в тот же топик подтверждением
+                    try:
+                        cfg = ch.config or {}
+                        if cfg.get("bot_token"):
+                            tg_send(cfg["bot_token"], chat_id,
+                                    f"Топик «{topic.name}» закреплён за рассылками CORPER.",
+                                    message_thread_id=int(thread_id))
+                    except Exception as e:
+                        log.warning("seed-confirm send failed: %s", e)
+                    log.info("topic registered: group=%s thread=%s name=%s",
+                             group.id, thread_id, topic.name)
+                    break
 
     # reply-match
     reply_to_internal = None

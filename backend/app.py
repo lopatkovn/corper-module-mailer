@@ -44,11 +44,20 @@ login_manager.request_loader(make_request_loader(core, app.config["SECRET_KEY"])
 
 
 from models import (  # noqa: E402, F401
-    Channel, TelegramGroup, EventType, RoutingRule,
+    Channel, TelegramGroup, TelegramTopic, TopicRegistration,
+    EventType, RoutingRule,
     Message, InboundMessage, PollState,
 )
-from routing import route_event  # noqa: E402
-from delivery_telegram import get_me as tg_get_me, get_chat_member as tg_get_member, TelegramError  # noqa: E402
+from routing import route_event_via_rules, deliver_explicit  # noqa: E402
+from delivery_telegram import (  # noqa: E402
+    get_me as tg_get_me,
+    get_chat_member as tg_get_member,
+    get_my_name, get_my_description, get_my_short_description, get_my_commands,
+    set_my_name, set_my_description, set_my_short_description, set_my_commands,
+    TelegramError,
+)
+import secrets as _secrets
+from datetime import timedelta
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -118,10 +127,13 @@ def _group_dict(g):
     return {
         "id": g.id, "company_id": g.company_id, "channel_id": g.channel_id,
         "chat_id": g.chat_id, "title": g.title, "chat_type": g.chat_type,
+        "is_forum": g.is_forum,
         "branch_id": g.branch_id,
+        "department_id": g.department_id,
         "is_member": g.is_member, "can_send": g.can_send,
         "last_seen_at": g.last_seen_at.isoformat() if g.last_seen_at else None,
         "added_at": g.added_at.isoformat() if g.added_at else None,
+        "archived_at": g.archived_at.isoformat() if g.archived_at else None,
     }
 
 
@@ -134,8 +146,10 @@ def _event_type_dict(et):
 def _rule_dict(r):
     return {
         "id": r.id, "company_id": r.company_id,
-        "event_type_id": r.event_type_id, "channel_id": r.channel_id,
-        "recipients": r.recipients or {},
+        "event_type_id": r.event_type_id,
+        "branch_id": r.branch_id,
+        "telegram_group_id": r.telegram_group_id,
+        "topic_id": r.topic_id,
         "is_enabled": r.is_enabled, "priority": r.priority,
     }
 
@@ -349,9 +363,11 @@ def bot_check():
 def list_groups():
     company_id = active_company_id(current_user, request)
     require_section(current_user, company_id, SECTION, core, "view")
-    rows = (TelegramGroup.query
-            .filter_by(company_id=company_id)
-            .order_by(TelegramGroup.added_at.desc()).all())
+    include_archived = request.args.get("include_archived") in ("1", "true")
+    q = TelegramGroup.query.filter_by(company_id=company_id)
+    if not include_archived:
+        q = q.filter(TelegramGroup.archived_at.is_(None))
+    rows = q.order_by(TelegramGroup.added_at.desc()).all()
     return jsonify([_group_dict(g) for g in rows])
 
 
@@ -377,13 +393,18 @@ def create_group():
     existing = TelegramGroup.query.filter_by(
         company_id=company_id, chat_id=chat_id).first()
     if existing is not None:
-        return jsonify({"error": "Такая группа уже есть", "id": existing.id}), 409
+        # idempotent: возвращаем существующую (восстанавливаем из архива если нужно)
+        if existing.archived_at is not None:
+            existing.archived_at = None
+            db.session.commit()
+        return jsonify(_group_dict(existing)), 200
 
     g = TelegramGroup(
         company_id=company_id, channel_id=c.id, chat_id=chat_id,
         title=str(data.get("title") or "")[:255],
         chat_type=data.get("chat_type") or "group",
         branch_id=data.get("branch_id"),
+        department_id=data.get("department_id"),
         is_member=False, can_send=False,
     )
     db.session.add(g)
@@ -526,30 +547,65 @@ def list_rules():
     return jsonify([_rule_dict(r) for r in rows])
 
 
+def _validate_rule_payload(data: dict, company_id: int) -> tuple[dict, dict | None]:
+    """Возвращает (clean_fields, error_dict). error=None если всё ок.
+
+    Новая схема правила (TG-only):
+      event_type_id (FK), branch_id (nullable), telegram_group_id (FK),
+      topic_id (nullable FK), is_enabled, priority.
+    """
+    out: dict = {}
+    if "event_type_id" in data:
+        et = EventType.query.get(int(data["event_type_id"] or 0))
+        if et is None:
+            return out, {"error": "event_type не найден"}
+        out["event_type_id"] = et.id
+    if "telegram_group_id" in data:
+        gid = int(data["telegram_group_id"] or 0)
+        g = TelegramGroup.query.filter_by(id=gid, company_id=company_id).first()
+        if g is None:
+            return out, {"error": "telegram_group_id не принадлежит компании"}
+        out["telegram_group_id"] = g.id
+    if "branch_id" in data:
+        bid = data.get("branch_id")
+        out["branch_id"] = int(bid) if bid not in (None, "") else None
+    if "topic_id" in data:
+        tid = data.get("topic_id")
+        if tid in (None, ""):
+            out["topic_id"] = None
+        else:
+            t = TelegramTopic.query.filter_by(id=int(tid),
+                                              company_id=company_id).first()
+            if t is None:
+                return out, {"error": "topic_id не принадлежит компании"}
+            out["topic_id"] = t.id
+    if "is_enabled" in data:
+        out["is_enabled"] = bool(data["is_enabled"])
+    if "priority" in data:
+        out["priority"] = int(data["priority"] or 100)
+    return out, None
+
+
 @app.post("/rules")
 @login_required
 def create_rule():
     company_id = active_company_id(current_user, request)
     require_section(current_user, company_id, SECTION, core, "manage")
     data = request.get_json(force=True) or {}
-    if not data.get("event_type_id") or not data.get("channel_id"):
-        return jsonify({"error": "event_type_id и channel_id обязательны"}), 400
-    # Валидация существования event_type
-    et = EventType.query.get(int(data["event_type_id"]))
-    if et is None:
-        return jsonify({"error": "event_type не найден"}), 400
-    # Валидация принадлежности канала компании
-    ch = Channel.query.get(int(data["channel_id"]))
-    if ch is None or ch.company_id != company_id:
-        return jsonify({"error": "channel_id не принадлежит компании"}), 400
+    if not data.get("event_type_id") or not data.get("telegram_group_id"):
+        return jsonify({"error": "event_type_id и telegram_group_id обязательны"}), 400
+    clean, err = _validate_rule_payload(data, company_id)
+    if err:
+        return jsonify(err), 400
 
     r = RoutingRule(
         company_id=company_id,
-        event_type_id=int(data["event_type_id"]),
-        channel_id=int(data["channel_id"]),
-        recipients=data.get("recipients") or {},
-        is_enabled=bool(data.get("is_enabled", True)),
-        priority=int(data.get("priority") or 100),
+        event_type_id=clean["event_type_id"],
+        branch_id=clean.get("branch_id"),
+        telegram_group_id=clean["telegram_group_id"],
+        topic_id=clean.get("topic_id"),
+        is_enabled=clean.get("is_enabled", True),
+        priority=clean.get("priority", 100),
     )
     db.session.add(r)
     db.session.commit()
@@ -563,19 +619,11 @@ def update_rule(rid):
     require_section(current_user, company_id, SECTION, core, "manage")
     r = RoutingRule.query.filter_by(id=rid, company_id=company_id).first_or_404()
     data = request.get_json(force=True) or {}
-    if "channel_id" in data:
-        ch = Channel.query.get(int(data["channel_id"]))
-        if ch is None or ch.company_id != company_id:
-            return jsonify({"error": "channel_id не принадлежит компании"}), 400
-        r.channel_id = int(data["channel_id"])
-    if "event_type_id" in data:
-        r.event_type_id = int(data["event_type_id"])
-    if "recipients" in data:
-        r.recipients = data["recipients"] or {}
-    if "is_enabled" in data:
-        r.is_enabled = bool(data["is_enabled"])
-    if "priority" in data:
-        r.priority = int(data["priority"])
+    clean, err = _validate_rule_payload(data, company_id)
+    if err:
+        return jsonify(err), 400
+    for k, v in clean.items():
+        setattr(r, k, v)
     db.session.commit()
     return jsonify(_rule_dict(r))
 
@@ -596,8 +644,14 @@ def delete_rule(rid):
 @app.post("/events")
 @login_required
 def receive_event():
-    """Inter-service: модули-источники постят сюда события. Routing engine
-    создаёт mailer.message(pending) для каждого получателя по матчу правил."""
+    """Inter-service: модули-источники постят сюда события.
+
+    Два режима (диспатч по полям):
+      • если задан `channel_kind` ИЛИ непустой `recipients` →
+        `deliver_explicit` (модуль сам выбрал кому/как);
+      • иначе → `route_event_via_rules` (TG-only через правила
+        с фильтром по `branch_id`).
+    """
     data = request.get_json(force=True) or {}
     try:
         company_id = int(data.get("company_id"))
@@ -608,27 +662,273 @@ def receive_event():
     if not event_type_key:
         return jsonify({"error": "event_type required"}), 400
 
-    # Любой залогиненный member компании может постить события от имени своего
-    # модуля. Реальное членство проверим: либо admin-bypass, либо company ∈
-    # current_user.company_ids
+    # Company-access check (admin bypass)
     if not _is_super_admin():
         cids = getattr(current_user, "_data", {}).get("company_ids") or []
         if company_id not in cids and getattr(current_user, "portal_role", "") != "admin":
             return jsonify({"error": "company access denied"}), 403
 
-    result = route_event(
-        db=db, core_client=core,
-        Channel=Channel, RoutingRule=RoutingRule, EventType=EventType,
-        Message=Message, TelegramGroup=TelegramGroup,
-        company_id=company_id,
-        source_module=source_module,
-        event_type_key=event_type_key,
-        payload=data.get("payload") or {},
-        branch_id=data.get("branch_id"),
-        dedup_key=data.get("dedup_key"),
-    )
+    channel_kind = (data.get("channel_kind") or "").strip().lower()
+    recipients = data.get("recipients") or {}
+    is_explicit = bool(channel_kind) or any(recipients.values()) if isinstance(recipients, dict) else False
+
+    if is_explicit:
+        if not channel_kind:
+            channel_kind = "email" if any(k in recipients for k in
+                                          ("emails", "employee_ids", "branch_ids")) else "telegram"
+        result = deliver_explicit(
+            db=db, core_client=core,
+            Channel=Channel, EventType=EventType,
+            Message=Message, TelegramGroup=TelegramGroup,
+            company_id=company_id,
+            source_module=source_module,
+            event_type_key=event_type_key,
+            channel_kind=channel_kind,
+            recipients=recipients,
+            subject=data.get("subject"),
+            body_text=data.get("body_text"),
+            body_html=data.get("body_html"),
+            payload=data.get("payload") or {},
+            parse_mode=data.get("parse_mode"),
+            dedup_key=data.get("dedup_key"),
+        )
+    else:
+        result = route_event_via_rules(
+            db=db,
+            Channel=Channel, RoutingRule=RoutingRule, EventType=EventType,
+            Message=Message, TelegramGroup=TelegramGroup,
+            TelegramTopic=TelegramTopic,
+            company_id=company_id,
+            source_module=source_module,
+            event_type_key=event_type_key,
+            branch_id=data.get("branch_id"),
+            subject=data.get("subject"),
+            body_text=data.get("body_text"),
+            body_html=data.get("body_html"),
+            payload=data.get("payload") or {},
+            dedup_key=data.get("dedup_key"),
+        )
+
+    if result.get("error"):
+        return jsonify(result), 400
     code = 202 if result.get("message_ids") else 200
     return jsonify(result), code
+
+
+# ── /bot/branding ─────────────────────────────────────────────────────────
+
+@app.get("/bot/branding")
+@login_required
+def get_bot_branding():
+    """Подтянуть текущие name/description/short_description/commands из Bot API."""
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "view")
+    c = Channel.query.filter_by(company_id=company_id, kind="telegram").first()
+    if c is None or not (c.config or {}).get("bot_token"):
+        return jsonify({"error": "bot_token не задан"}), 400
+    token = c.config["bot_token"]
+    out = {"name": "", "description": "", "short_description": "", "commands": []}
+    errors = []
+    for key, fn in (("name", get_my_name),
+                    ("description", get_my_description),
+                    ("short_description", get_my_short_description)):
+        try:
+            res = fn(token)
+            out[key] = (res or {}).get(key) or ""
+        except TelegramError as e:
+            errors.append(f"{key}: {e}")
+    try:
+        out["commands"] = get_my_commands(token)
+    except TelegramError as e:
+        errors.append(f"commands: {e}")
+    if errors:
+        out["_errors"] = errors
+    return jsonify(out)
+
+
+@app.put("/bot/branding")
+@login_required
+def put_bot_branding():
+    """Установить непустые поля через Bot API (set_my_*)."""
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "manage")
+    c = Channel.query.filter_by(company_id=company_id, kind="telegram").first()
+    if c is None or not (c.config or {}).get("bot_token"):
+        return jsonify({"error": "bot_token не задан"}), 400
+    token = c.config["bot_token"]
+    data = request.get_json(force=True) or {}
+    applied: list[str] = []
+    errors: list[str] = []
+
+    def _try(field: str, fn, *args):
+        try:
+            fn(token, *args)
+            applied.append(field)
+        except TelegramError as e:
+            errors.append(f"{field}: {e}")
+
+    if "name" in data:
+        _try("name", set_my_name, str(data.get("name") or "")[:64])
+    if "description" in data:
+        _try("description", set_my_description, str(data.get("description") or "")[:512])
+    if "short_description" in data:
+        _try("short_description", set_my_short_description,
+             str(data.get("short_description") or "")[:120])
+    if "commands" in data:
+        cmds = data.get("commands") or []
+        # клиент кладёт list[{command, description}]; нормализуем
+        norm = []
+        for cmd in cmds:
+            if not isinstance(cmd, dict): continue
+            c_name = (cmd.get("command") or "").strip().lstrip("/")
+            c_desc = (cmd.get("description") or "").strip()
+            if c_name and c_desc:
+                norm.append({"command": c_name[:32], "description": c_desc[:256]})
+        _try("commands", set_my_commands, norm)
+    return jsonify({"ok": not errors, "applied": applied, "errors": errors})
+
+
+# ── /topics + /topic-registrations ────────────────────────────────────────
+
+def _topic_dict(t):
+    return {
+        "id": t.id, "group_id": t.group_id,
+        "telegram_thread_id": t.telegram_thread_id,
+        "name": t.name,
+        "registered_at": t.registered_at.isoformat() if t.registered_at else None,
+    }
+
+
+@app.get("/groups/<int:gid>/topics")
+@login_required
+def list_group_topics(gid):
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "view")
+    g = TelegramGroup.query.filter_by(id=gid, company_id=company_id).first_or_404()
+    rows = (TelegramTopic.query
+            .filter_by(group_id=g.id, archived_at=None)
+            .order_by(TelegramTopic.name.asc()).all())
+    return jsonify([_topic_dict(t) for t in rows])
+
+
+# Список существительных для seed-фразы — читаемо + неконфликтно.
+_PHRASE_WORDS = (
+    "LIME RAY SAGE INK MINT JADE PEAK FROG BIRD KOI "
+    "OAK FOX OWL ELK WOLF CRANE LARK SWAN STAR MOON "
+    "RIVER LAKE SAND DUNE PINE FERN MAPLE PETAL CLOVER "
+    "CORAL AMBER PEARL OPAL TOPAZ FLINT NOVA NEBULA"
+).split()
+
+
+def _generate_phrase() -> str:
+    """`TOPIC-LIME-4Q7K-2026` — TTL и сама фраза удобочитаемы."""
+    word = _secrets.choice(_PHRASE_WORDS)
+    salt = _secrets.token_hex(2).upper()  # 4 hex символа
+    year = datetime.utcnow().year
+    return f"TOPIC-{word}-{salt}-{year}"
+
+
+def _topic_reg_dict(p):
+    return {
+        "id": p.id, "phrase": p.phrase, "name": p.name,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "expires_at": p.expires_at.isoformat() if p.expires_at else None,
+        "consumed_at": p.consumed_at.isoformat() if p.consumed_at else None,
+        "topic": _topic_dict(TelegramTopic.query.get(p.topic_id)) if p.topic_id else None,
+    }
+
+
+@app.post("/groups/<int:gid>/topic-registrations")
+@login_required
+def create_topic_registration(gid):
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "manage")
+    g = TelegramGroup.query.filter_by(id=gid, company_id=company_id).first_or_404()
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()[:255] or None
+    # уникальный phrase (retry на маловероятную коллизию)
+    for _ in range(5):
+        phrase = _generate_phrase()
+        if not TopicRegistration.query.filter_by(phrase=phrase).first():
+            break
+    else:
+        return jsonify({"error": "phrase collision"}), 500
+    p = TopicRegistration(
+        company_id=company_id, group_id=g.id,
+        phrase=phrase, name=name,
+        expires_at=datetime.utcnow() + timedelta(minutes=15),
+    )
+    db.session.add(p)
+    db.session.commit()
+    return jsonify(_topic_reg_dict(p)), 201
+
+
+@app.get("/topic-registrations/<int:pid>")
+@login_required
+def get_topic_registration(pid):
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "view")
+    p = TopicRegistration.query.filter_by(id=pid, company_id=company_id).first_or_404()
+    return jsonify(_topic_reg_dict(p))
+
+
+# ── /groups/by-dept (inter-service: вызывает core-registry при toggle) ────
+
+@app.post("/groups/by-dept")
+@login_required
+def upsert_group_by_dept():
+    """Inter-service: core-registry зовёт при включении `is_telegram_group=true`
+    в Структуре. Создаёт или восстанавливает группу для department_id."""
+    if not _is_super_admin():
+        return jsonify({"error": "super_admin required"}), 403
+    data = request.get_json(force=True) or {}
+    try:
+        company_id = int(data["company_id"])
+        department_id = int(data["department_id"])
+        chat_id = int(data["chat_id"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "company_id, department_id, chat_id обязательны"}), 400
+    title = str(data.get("title") or "")[:255]
+
+    ch = Channel.query.filter_by(company_id=company_id, kind="telegram").first()
+    if ch is None:
+        # Канала ещё нет — создадим пустой (admin позже сконфигурирует bot_token)
+        ch = Channel(company_id=company_id, kind="telegram",
+                     is_enabled=False, config={})
+        db.session.add(ch)
+        db.session.flush()
+
+    g = TelegramGroup.query.filter_by(company_id=company_id,
+                                      chat_id=chat_id).first()
+    if g is None:
+        g = TelegramGroup(
+            company_id=company_id, channel_id=ch.id, chat_id=chat_id,
+            title=title or f"Dept #{department_id}",
+            chat_type="group", department_id=department_id,
+            is_member=False, can_send=False,
+        )
+        db.session.add(g)
+    else:
+        g.department_id = department_id
+        if title:
+            g.title = title
+        g.archived_at = None  # restore из архива
+    db.session.commit()
+    return jsonify(_group_dict(g)), 200
+
+
+@app.put("/groups/by-dept/<int:did>/archive")
+@login_required
+def archive_group_by_dept(did):
+    """Inter-service: при выключении `is_telegram_group=false` в Структуре."""
+    if not _is_super_admin():
+        return jsonify({"error": "super_admin required"}), 403
+    rows = TelegramGroup.query.filter_by(department_id=did,
+                                         archived_at=None).all()
+    for g in rows:
+        g.archived_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({"archived": [g.id for g in rows]})
 
 
 # ── /messages, /inbound (журнал, read-only) ───────────────────────────────

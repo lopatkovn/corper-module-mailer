@@ -18,10 +18,25 @@ const emit = defineEmits<{
 const { canManage, branches } = usePortal()
 
 interface Group {
-  id: number; chat_id: number; title: string; chat_type: string;
+  id: number; chat_id: number; title: string; chat_type: string; is_forum?: boolean;
   branch_id: number | null
+  department_id?: number | null
   is_member: boolean; can_send: boolean
   last_seen_at: string | null; added_at: string
+}
+
+interface Topic { id: number; telegram_thread_id: number; name: string }
+const topicsCount = ref<Record<number, number>>({})
+
+async function loadTopicCounts(groupList: Group[]) {
+  const out: Record<number, number> = {}
+  await Promise.all(groupList.filter(g => g.is_forum).map(async g => {
+    try {
+      const ts: Topic[] = await api.get(`/api/mailer/groups/${g.id}/topics`).then(r => r.data)
+      out[g.id] = ts.length
+    } catch { out[g.id] = 0 }
+  }))
+  topicsCount.value = out
 }
 
 const groups = ref<Group[]>([])
@@ -37,6 +52,7 @@ async function load() {
   loading.value = true
   try {
     groups.value = await api.get('/api/mailer/groups').then(r => r.data)
+    await loadTopicCounts(groups.value)
     emit('count', groups.value.length)
   } finally {
     loading.value = false
@@ -152,6 +168,9 @@ onUpdated(() => nextTick(() => feather?.replace()))
               <span v-if="g.chat_type === 'channel'" class="gr-card__role" title="Канал">
                 <i data-feather="radio"></i>
               </span>
+              <span v-if="g.is_forum" class="gr-card__role" title="Форум-чат (топики)">
+                <i data-feather="hash"></i>
+              </span>
             </div>
             <span :class="['badge', `badge--${statusOf(g).variant}`]">
               {{ statusOf(g).label }}
@@ -164,6 +183,10 @@ onUpdated(() => nextTick(() => feather?.replace()))
             <div class="gr-card__meta-row">
               <i data-feather="hash"></i>
               <span class="gr-card__mono">{{ g.chat_id }}</span>
+            </div>
+            <div v-if="g.is_forum" class="gr-card__meta-row">
+              <i data-feather="message-square"></i>
+              <span>{{ topicsCount[g.id] || 0 }} {{ (topicsCount[g.id] || 0) === 1 ? 'топик' : 'топиков' }}</span>
             </div>
             <div v-if="g.branch_id" class="gr-card__meta-row">
               <i data-feather="map-pin"></i>

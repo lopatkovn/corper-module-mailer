@@ -51,16 +51,62 @@ class TelegramGroup(db.Model):
                             nullable=False, index=True)
     chat_id     = db.Column(db.BigInteger, nullable=False)
     title       = db.Column(db.String(255), nullable=False, default="")
-    chat_type   = db.Column(db.String(20), nullable=False, default="group")  # group|supergroup|channel
+    chat_type   = db.Column(db.String(20), nullable=False, default="group")  # group|supergroup|channel|forum
+    is_forum    = db.Column(db.Boolean, nullable=False, default=False)  # форум-чат поддерживает топики
     branch_id   = db.Column(db.Integer, nullable=True, index=True)
+    department_id = db.Column(db.Integer, nullable=True, index=True)  # soft-FK на core.department.id (cross-schema)
     is_member   = db.Column(db.Boolean, nullable=False, default=False)
     can_send    = db.Column(db.Boolean, nullable=False, default=False)
     last_seen_at = db.Column(db.DateTime, nullable=True)
     added_at    = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    archived_at = db.Column(db.DateTime, nullable=True)  # soft-archive (toggle OFF в Структуре)
 
     __table_args__ = (
         db.UniqueConstraint("company_id", "chat_id", name="uq_telegram_group_company_chat"),
     )
+
+
+# ── telegram_topic ─────────────────────────────────────────────────────────
+class TelegramTopic(db.Model):
+    """Зарегистрированный форум-топик в Telegram-группе."""
+    __tablename__ = "telegram_topic"
+
+    id                 = db.Column(db.Integer, primary_key=True)
+    company_id         = db.Column(db.Integer, nullable=False, index=True)
+    group_id           = db.Column(db.Integer, db.ForeignKey("telegram_group.id", ondelete="CASCADE"),
+                                   nullable=False, index=True)
+    telegram_thread_id = db.Column(db.BigInteger, nullable=False)
+    name               = db.Column(db.String(255), nullable=False, default="")
+    registered_at      = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    archived_at        = db.Column(db.DateTime, nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("group_id", "telegram_thread_id", name="uq_telegram_topic_group_thread"),
+    )
+
+
+# ── topic_registration ─────────────────────────────────────────────────────
+class TopicRegistration(db.Model):
+    """Pending seed-фраза, ждущая распознавания ботом в форум-топике.
+
+    Lifecycle:
+      created (UI запрос) → expires_at = now()+15min
+      consumed_at != null → бот распознал, topic_id указывает на созданный TelegramTopic
+      expires_at < now() and consumed_at is null → истекло
+    """
+    __tablename__ = "topic_registration"
+
+    id           = db.Column(db.Integer, primary_key=True)
+    company_id   = db.Column(db.Integer, nullable=False, index=True)
+    group_id     = db.Column(db.Integer, db.ForeignKey("telegram_group.id", ondelete="CASCADE"),
+                             nullable=False, index=True)
+    phrase       = db.Column(db.String(64), nullable=False, unique=True)
+    name         = db.Column(db.String(255), nullable=True)
+    created_at   = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    expires_at   = db.Column(db.DateTime, nullable=False)
+    consumed_at  = db.Column(db.DateTime, nullable=True)
+    topic_id     = db.Column(db.Integer, db.ForeignKey("telegram_topic.id", ondelete="SET NULL"),
+                             nullable=True)
 
 
 # ── event_type ─────────────────────────────────────────────────────────────
@@ -77,21 +123,28 @@ class EventType(db.Model):
 
 # ── routing_rule ───────────────────────────────────────────────────────────
 class RoutingRule(db.Model):
-    """Правило маршрутизации: event_type → channel → получатели."""
+    """Правило маршрутизации TG-доставки:
+       event_type [× branch_filter] → telegram_group [× topic].
+
+    Email-доставка НЕ ходит через rules — source-модули шлют /events
+    с явными recipients в режиме `channel_kind='email'`.
+    """
     __tablename__ = "routing_rule"
 
-    id            = db.Column(db.Integer, primary_key=True)
-    company_id    = db.Column(db.Integer, nullable=False, index=True)
-    event_type_id = db.Column(db.Integer, db.ForeignKey("event_type.id", ondelete="CASCADE"),
-                              nullable=False, index=True)
-    channel_id    = db.Column(db.Integer, db.ForeignKey("channel.id", ondelete="CASCADE"),
-                              nullable=False, index=True)
-    recipients    = db.Column(JSONB, nullable=False, default=dict)  # {employee_ids, branch_ids, group_id, ...}
-    is_enabled    = db.Column(db.Boolean, nullable=False, default=True)
-    priority      = db.Column(db.Integer, nullable=False, default=100)
-    created_at    = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at    = db.Column(db.DateTime, default=datetime.utcnow,
-                              onupdate=datetime.utcnow, nullable=False)
+    id                = db.Column(db.Integer, primary_key=True)
+    company_id        = db.Column(db.Integer, nullable=False, index=True)
+    event_type_id     = db.Column(db.Integer, db.ForeignKey("event_type.id", ondelete="CASCADE"),
+                                  nullable=False, index=True)
+    branch_id         = db.Column(db.Integer, nullable=True, index=True)  # NULL = любой филиал
+    telegram_group_id = db.Column(db.Integer, db.ForeignKey("telegram_group.id", ondelete="CASCADE"),
+                                  nullable=False, index=True)
+    topic_id          = db.Column(db.Integer, db.ForeignKey("telegram_topic.id", ondelete="SET NULL"),
+                                  nullable=True, index=True)  # NULL = общий чат группы
+    is_enabled        = db.Column(db.Boolean, nullable=False, default=True)
+    priority          = db.Column(db.Integer, nullable=False, default=100)
+    created_at        = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at        = db.Column(db.DateTime, default=datetime.utcnow,
+                                  onupdate=datetime.utcnow, nullable=False)
 
 
 # ── message ────────────────────────────────────────────────────────────────
