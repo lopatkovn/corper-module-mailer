@@ -829,13 +829,29 @@ def _generate_phrase() -> str:
 
 
 def _topic_reg_dict(p):
-    return {
+    """Pending-registration dict — работает для обоих режимов:
+
+      • topic-binding (изначально group_id != NULL): на consume topic_id
+        указывает на созданный TelegramTopic;
+      • group-binding (изначально group_id IS NULL → ставится на consume):
+        на consume group_id указывает на созданную TelegramGroup, topic_id NULL.
+    """
+    is_group_mode = p.topic_id is None and p.consumed_at is not None
+    out = {
         "id": p.id, "phrase": p.phrase, "name": p.name,
+        "mode": "group" if (p.group_id is None and not p.consumed_at) or is_group_mode else "topic",
+        "group_id_target": p.group_id,
         "created_at": p.created_at.isoformat() if p.created_at else None,
         "expires_at": p.expires_at.isoformat() if p.expires_at else None,
         "consumed_at": p.consumed_at.isoformat() if p.consumed_at else None,
         "topic": _topic_dict(TelegramTopic.query.get(p.topic_id)) if p.topic_id else None,
+        "group": None,
     }
+    if is_group_mode and p.group_id:
+        g = TelegramGroup.query.get(p.group_id)
+        if g is not None:
+            out["group"] = _group_dict(g)
+    return out
 
 
 @app.post("/groups/<int:gid>/topic-registrations")
@@ -870,6 +886,262 @@ def get_topic_registration(pid):
     require_section(current_user, company_id, SECTION, core, "view")
     p = TopicRegistration.query.filter_by(id=pid, company_id=company_id).first_or_404()
     return jsonify(_topic_reg_dict(p))
+
+
+# ── /groups/registrations — seed-привязка САМОЙ группы ──────────────────
+# Альтернатива ручному chat_id-вводу: бот должен быть в чате, юзер копирует
+# фразу из UI в любое сообщение чата → бот распознаёт → регистрирует группу
+# с chat_id из msg.chat.id.
+
+@app.post("/groups/registrations")
+@login_required
+def create_group_registration():
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "manage")
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()[:255] or None
+    for _ in range(5):
+        phrase = _generate_phrase()
+        if not TopicRegistration.query.filter_by(phrase=phrase).first():
+            break
+    else:
+        return jsonify({"error": "phrase collision"}), 500
+    p = TopicRegistration(
+        company_id=company_id, group_id=None,   # NULL → group-binding mode
+        phrase=phrase, name=name,
+        expires_at=datetime.utcnow() + timedelta(minutes=15),
+    )
+    db.session.add(p)
+    db.session.commit()
+    return jsonify(_topic_reg_dict(p)), 201
+
+
+@app.get("/groups/registrations/<int:pid>")
+@login_required
+def get_group_registration(pid):
+    company_id = active_company_id(current_user, request)
+    require_section(current_user, company_id, SECTION, core, "view")
+    p = TopicRegistration.query.filter_by(id=pid, company_id=company_id).first_or_404()
+    return jsonify(_topic_reg_dict(p))
+
+
+# ── /admin/* — системный канал (super_admin only, company_id IS NULL) ─────
+
+def _admin_or_403():
+    if not _is_super_admin():
+        return jsonify({"error": "super_admin required"}), 403
+    return None
+
+
+def _get_or_create_system_channel(kind: str):
+    """company_id IS NULL → системный канал. Один на kind."""
+    c = Channel.query.filter(Channel.company_id.is_(None),
+                             Channel.kind == kind).first()
+    if c is None:
+        c = Channel(company_id=None, kind=kind, is_enabled=False, config={})
+        db.session.add(c)
+        db.session.flush()
+    return c
+
+
+def _system_channel_payload(c):
+    """View с маскированным секретом — для GET /admin/channels/<kind>."""
+    if c is None:
+        return {"kind": None, "is_enabled": False, "label": "",
+                "config": {},
+                "last_test_at": None, "last_test_ok": None, "last_test_error": None}
+    cfg = _mask_email_config(c.config or {}) if c.kind == "email" else _mask_telegram_config(c.config or {})
+    return {
+        "kind": c.kind,
+        "is_enabled": c.is_enabled,
+        "label": c.label or "",
+        "config": cfg,
+        "last_test_at": c.last_test_at.isoformat() if c.last_test_at else None,
+        "last_test_ok": c.last_test_ok,
+        "last_test_error": c.last_test_error,
+    }
+
+
+@app.get("/admin/channels")
+@login_required
+def admin_list_channels():
+    err = _admin_or_403()
+    if err: return err
+    rows = {c.kind: c for c in
+            Channel.query.filter(Channel.company_id.is_(None)).all()}
+    return jsonify([_channel_public(rows.get(k), k) for k in _PUBLIC_CHANNEL_KINDS])
+
+
+@app.get("/admin/channels/<kind>")
+@login_required
+def admin_get_channel(kind):
+    err = _admin_or_403()
+    if err: return err
+    if kind not in ("email", "telegram"):
+        return jsonify({"error": "unknown kind"}), 400
+    c = Channel.query.filter(Channel.company_id.is_(None),
+                             Channel.kind == kind).first()
+    return jsonify(_system_channel_payload(c))
+
+
+@app.put("/admin/channels/<kind>")
+@login_required
+def admin_put_channel(kind):
+    err = _admin_or_403()
+    if err: return err
+    if kind not in ("email", "telegram"):
+        return jsonify({"error": "unknown kind"}), 400
+    data = request.get_json(force=True) or {}
+    cfg_in = dict(data.get("config") or {})
+    c = _get_or_create_system_channel(kind)
+    if "is_enabled" in data:
+        c.is_enabled = bool(data["is_enabled"])
+    if "label" in data:
+        c.label = str(data.get("label") or "")[:120]
+    merged = dict(c.config or {})
+    if kind == "email":
+        for k in ("host", "port", "use_tls", "username", "sender_name", "sender_email"):
+            if k in cfg_in:
+                merged[k] = cfg_in[k]
+        if "password" in cfg_in and cfg_in.get("password"):
+            merged["password"] = cfg_in["password"]
+    else:  # telegram
+        for k in ("bot_username", "bot_id"):
+            if k in cfg_in:
+                merged[k] = cfg_in[k]
+        if "bot_token" in cfg_in and cfg_in.get("bot_token"):
+            merged["bot_token"] = cfg_in["bot_token"]
+    c.config = merged
+    c.last_test_at = None
+    c.last_test_ok = None
+    c.last_test_error = None
+    db.session.commit()
+    return jsonify({"id": c.id, "kind": c.kind, "is_enabled": c.is_enabled})
+
+
+@app.post("/admin/channels/email/test")
+@login_required
+def admin_email_test():
+    err = _admin_or_403()
+    if err: return err
+    data = request.get_json(force=True) or {}
+    to_addr = (data.get("to") or "").strip()
+    if not to_addr or "@" not in to_addr:
+        return jsonify({"error": "Укажите корректный email"}), 400
+    c = Channel.query.filter(Channel.company_id.is_(None),
+                             Channel.kind == "email").first()
+    if c is None or not c.is_enabled:
+        return jsonify({"error": "Системный email не настроен"}), 400
+    m = Message(
+        company_id=None, channel_id=c.id,
+        source_module="_system", event_type="_test.email",
+        payload={"requested_by": current_user.id},
+        to_address=to_addr,
+        subject="Тестовое письмо CORPER (system)",
+        body_text=(f"Это тестовое письмо системного канала CORPER.\n"
+                   f"Время: {datetime.utcnow().isoformat()}Z\n"),
+        status="pending",
+    )
+    db.session.add(m)
+    db.session.commit()
+    return jsonify({"message_id": m.id, "status": "pending"}), 202
+
+
+@app.post("/admin/bot/check")
+@login_required
+def admin_bot_check():
+    err = _admin_or_403()
+    if err: return err
+    c = Channel.query.filter(Channel.company_id.is_(None),
+                             Channel.kind == "telegram").first()
+    if c is None:
+        return jsonify({"error": "Системный Telegram-канал не настроен"}), 400
+    cfg = c.config or {}
+    if not cfg.get("bot_token"):
+        return jsonify({"error": "bot_token не задан"}), 400
+    try:
+        info = tg_get_me(cfg["bot_token"])
+    except TelegramError as e:
+        c.last_test_at = datetime.utcnow()
+        c.last_test_ok = False
+        c.last_test_error = str(e)
+        db.session.commit()
+        return jsonify({"ok": False, "error": str(e)}), 200
+    cfg["bot_id"] = info.get("id")
+    cfg["bot_username"] = info.get("username")
+    c.config = dict(cfg)
+    c.last_test_at = datetime.utcnow()
+    c.last_test_ok = True
+    c.last_test_error = None
+    db.session.commit()
+    return jsonify({"ok": True, "bot_id": info.get("id"),
+                    "bot_username": info.get("username"),
+                    "first_name": info.get("first_name")}), 200
+
+
+@app.get("/admin/bot/branding")
+@login_required
+def admin_get_bot_branding():
+    err = _admin_or_403()
+    if err: return err
+    c = Channel.query.filter(Channel.company_id.is_(None),
+                             Channel.kind == "telegram").first()
+    if c is None or not (c.config or {}).get("bot_token"):
+        return jsonify({"error": "bot_token не задан"}), 400
+    token = c.config["bot_token"]
+    out = {"name": "", "description": "", "short_description": "", "commands": []}
+    errors = []
+    for key, fn in (("name", get_my_name),
+                    ("description", get_my_description),
+                    ("short_description", get_my_short_description)):
+        try:
+            res = fn(token)
+            out[key] = (res or {}).get(key) or ""
+        except TelegramError as e:
+            errors.append(f"{key}: {e}")
+    try:
+        out["commands"] = get_my_commands(token)
+    except TelegramError as e:
+        errors.append(f"commands: {e}")
+    if errors:
+        out["_errors"] = errors
+    return jsonify(out)
+
+
+@app.put("/admin/bot/branding")
+@login_required
+def admin_put_bot_branding():
+    err = _admin_or_403()
+    if err: return err
+    c = Channel.query.filter(Channel.company_id.is_(None),
+                             Channel.kind == "telegram").first()
+    if c is None or not (c.config or {}).get("bot_token"):
+        return jsonify({"error": "bot_token не задан"}), 400
+    token = c.config["bot_token"]
+    data = request.get_json(force=True) or {}
+    applied: list[str] = []
+    errors: list[str] = []
+    def _try(field, fn, *args):
+        try: fn(token, *args); applied.append(field)
+        except TelegramError as e: errors.append(f"{field}: {e}")
+    if "name" in data:
+        _try("name", set_my_name, str(data.get("name") or "")[:64])
+    if "description" in data:
+        _try("description", set_my_description, str(data.get("description") or "")[:512])
+    if "short_description" in data:
+        _try("short_description", set_my_short_description,
+             str(data.get("short_description") or "")[:120])
+    if "commands" in data:
+        cmds = data.get("commands") or []
+        norm = []
+        for cmd in cmds:
+            if not isinstance(cmd, dict): continue
+            cn = (cmd.get("command") or "").strip().lstrip("/")
+            cd = (cmd.get("description") or "").strip()
+            if cn and cd:
+                norm.append({"command": cn[:32], "description": cd[:256]})
+        _try("commands", set_my_commands, norm)
+    return jsonify({"ok": not errors, "applied": applied, "errors": errors})
 
 
 # ── /groups/by-dept (inter-service: вызывает core-registry при toggle) ────

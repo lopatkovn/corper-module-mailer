@@ -324,56 +324,103 @@ def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
     text = msg.get("text") or msg.get("caption")
     thread_id = msg.get("message_thread_id")   # есть только в форум-топиках
 
-    # ── Topic-registration: матчим pending-фразу в форум-топике ──────────
-    # Если сообщение пришло из форум-топика и текст содержит активную
-    # seed-фразу — закрепляем (group_id, thread_id, name) и отвечаем
-    # подтверждением в этот же топик.
-    if thread_id and text:
-        group = TelegramGroup.query.filter_by(
-            company_id=ch.company_id, chat_id=int(chat_id)).first()
-        if group is not None:
-            # пометим группу как форум (раз тут пришёл thread_id)
-            if not group.is_forum:
-                group.is_forum = True
-            pending_list = (TopicRegistration.query
-                            .filter(TopicRegistration.consumed_at.is_(None),
-                                    TopicRegistration.expires_at > datetime.utcnow(),
-                                    TopicRegistration.group_id == group.id)
-                            .all())
-            for p in pending_list:
+    # ── Seed-фраза: матчим pending TopicRegistration ─────────────────────
+    # Дуальный режим — одна таблица обслуживает оба сценария:
+    #   • group_id IS NULL  → пользователь хочет привязать ГРУППУ через фразу.
+    #     Фраза вставляется в любое сообщение чата → создаём TelegramGroup
+    #     с chat_id из сообщения, name из p.name или msg.chat.title.
+    #   • group_id IS NOT NULL → пользователь хочет привязать ТОПИК внутри
+    #     этой группы. Фраза должна прийти в форум-топике (thread_id != None).
+    if text:
+        # сначала пробуем group-registration (без привязки к существующей группе)
+        if not thread_id:
+            pending_g = (TopicRegistration.query
+                         .filter(TopicRegistration.consumed_at.is_(None),
+                                 TopicRegistration.expires_at > datetime.utcnow(),
+                                 TopicRegistration.company_id == ch.company_id,
+                                 TopicRegistration.group_id.is_(None))
+                         .all())
+            for p in pending_g:
                 if p.phrase and p.phrase in text:
-                    topic = (TelegramTopic.query
-                             .filter_by(group_id=group.id,
-                                        telegram_thread_id=int(thread_id))
-                             .first())
-                    if topic is None:
-                        topic = TelegramTopic(
-                            company_id=ch.company_id, group_id=group.id,
-                            telegram_thread_id=int(thread_id),
-                            name=p.name or f"Топик #{thread_id}",
+                    g = TelegramGroup.query.filter_by(
+                        company_id=ch.company_id, chat_id=int(chat_id)).first()
+                    chat_title = chat.get("title") or chat.get("username") or ""
+                    if g is None:
+                        g = TelegramGroup(
+                            company_id=ch.company_id, channel_id=ch.id,
+                            chat_id=int(chat_id),
+                            title=p.name or chat_title or f"Чат {chat_id}",
+                            chat_type=chat.get("type") or "group",
+                            is_member=True, can_send=True,
+                            last_seen_at=datetime.utcnow(),
                         )
-                        db.session.add(topic)
+                        db.session.add(g)
                         db.session.flush()
                     else:
+                        if g.archived_at:
+                            g.archived_at = None
                         if p.name:
-                            topic.name = p.name
-                        if topic.archived_at:
-                            topic.archived_at = None
+                            g.title = p.name
+                        g.last_seen_at = datetime.utcnow()
                     p.consumed_at = datetime.utcnow()
-                    p.topic_id = topic.id
+                    p.group_id = g.id  # сохраним результат для UI-поллинга
                     db.session.commit()
-                    # отвечаем в тот же топик подтверждением
                     try:
                         cfg = ch.config or {}
                         if cfg.get("bot_token"):
                             tg_send(cfg["bot_token"], chat_id,
-                                    f"Топик «{topic.name}» закреплён за рассылками CORPER.",
-                                    message_thread_id=int(thread_id))
+                                    f"Группа «{g.title}» закреплена за рассылками CORPER.")
                     except Exception as e:
-                        log.warning("seed-confirm send failed: %s", e)
-                    log.info("topic registered: group=%s thread=%s name=%s",
-                             group.id, thread_id, topic.name)
+                        log.warning("seed-confirm group send failed: %s", e)
+                    log.info("group registered via seed: chat=%s name=%s",
+                             chat_id, g.title)
                     break
+
+        # затем — topic-registration в форум-топике
+        if thread_id:
+            group = TelegramGroup.query.filter_by(
+                company_id=ch.company_id, chat_id=int(chat_id)).first()
+            if group is not None:
+                if not group.is_forum:
+                    group.is_forum = True
+                pending_list = (TopicRegistration.query
+                                .filter(TopicRegistration.consumed_at.is_(None),
+                                        TopicRegistration.expires_at > datetime.utcnow(),
+                                        TopicRegistration.group_id == group.id)
+                                .all())
+                for p in pending_list:
+                    if p.phrase and p.phrase in text:
+                        topic = (TelegramTopic.query
+                                 .filter_by(group_id=group.id,
+                                            telegram_thread_id=int(thread_id))
+                                 .first())
+                        if topic is None:
+                            topic = TelegramTopic(
+                                company_id=ch.company_id, group_id=group.id,
+                                telegram_thread_id=int(thread_id),
+                                name=p.name or f"Топик #{thread_id}",
+                            )
+                            db.session.add(topic)
+                            db.session.flush()
+                        else:
+                            if p.name:
+                                topic.name = p.name
+                            if topic.archived_at:
+                                topic.archived_at = None
+                        p.consumed_at = datetime.utcnow()
+                        p.topic_id = topic.id
+                        db.session.commit()
+                        try:
+                            cfg = ch.config or {}
+                            if cfg.get("bot_token"):
+                                tg_send(cfg["bot_token"], chat_id,
+                                        f"Топик «{topic.name}» закреплён за рассылками CORPER.",
+                                        message_thread_id=int(thread_id))
+                        except Exception as e:
+                            log.warning("seed-confirm send failed: %s", e)
+                        log.info("topic registered: group=%s thread=%s name=%s",
+                                 group.id, thread_id, topic.name)
+                        break
 
     # reply-match
     reply_to_internal = None

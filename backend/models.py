@@ -22,7 +22,7 @@ class Channel(db.Model):
     __tablename__ = "channel"
 
     id          = db.Column(db.Integer, primary_key=True)
-    company_id  = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
     kind        = db.Column(db.String(20), nullable=False)   # 'email' | 'telegram'
     is_enabled  = db.Column(db.Boolean, nullable=False, default=False)
     label       = db.Column(db.String(120), nullable=False, default="")
@@ -46,7 +46,7 @@ class TelegramGroup(db.Model):
     __tablename__ = "telegram_group"
 
     id          = db.Column(db.Integer, primary_key=True)
-    company_id  = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
     channel_id  = db.Column(db.Integer, db.ForeignKey("channel.id", ondelete="CASCADE"),
                             nullable=False, index=True)
     chat_id     = db.Column(db.BigInteger, nullable=False)
@@ -72,7 +72,7 @@ class TelegramTopic(db.Model):
     __tablename__ = "telegram_topic"
 
     id                 = db.Column(db.Integer, primary_key=True)
-    company_id         = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
     group_id           = db.Column(db.Integer, db.ForeignKey("telegram_group.id", ondelete="CASCADE"),
                                    nullable=False, index=True)
     telegram_thread_id = db.Column(db.BigInteger, nullable=False)
@@ -97,9 +97,12 @@ class TopicRegistration(db.Model):
     __tablename__ = "topic_registration"
 
     id           = db.Column(db.Integer, primary_key=True)
-    company_id   = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
+    # group_id IS NULL → pending регистрация группы (фраза вставляется в
+    # любой чат, где бот, → создаём TelegramGroup с chat_id=сообщения).
+    # group_id IS NOT NULL → pending регистрация топика в этой группе.
     group_id     = db.Column(db.Integer, db.ForeignKey("telegram_group.id", ondelete="CASCADE"),
-                             nullable=False, index=True)
+                             nullable=True, index=True)
     phrase       = db.Column(db.String(64), nullable=False, unique=True)
     name         = db.Column(db.String(255), nullable=True)
     created_at   = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
@@ -132,7 +135,7 @@ class RoutingRule(db.Model):
     __tablename__ = "routing_rule"
 
     id                = db.Column(db.Integer, primary_key=True)
-    company_id        = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
     event_type_id     = db.Column(db.Integer, db.ForeignKey("event_type.id", ondelete="CASCADE"),
                                   nullable=False, index=True)
     branch_id         = db.Column(db.Integer, nullable=True, index=True)  # NULL = любой филиал
@@ -153,7 +156,7 @@ class Message(db.Model):
     __tablename__ = "message"
 
     id            = db.Column(db.Integer, primary_key=True)
-    company_id    = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
     channel_id    = db.Column(db.Integer, db.ForeignKey("channel.id", ondelete="SET NULL"),
                               nullable=True, index=True)
     source_module = db.Column(db.String(60), nullable=False, default="core")
@@ -184,7 +187,7 @@ class InboundMessage(db.Model):
     __tablename__ = "inbound_message"
 
     id            = db.Column(db.Integer, primary_key=True)
-    company_id    = db.Column(db.Integer, nullable=False, index=True)
+    company_id  = db.Column(db.Integer, nullable=True, index=True)
     channel_id    = db.Column(db.Integer, db.ForeignKey("channel.id", ondelete="CASCADE"),
                               nullable=False, index=True)
     chat_id       = db.Column(db.BigInteger, nullable=False, index=True)

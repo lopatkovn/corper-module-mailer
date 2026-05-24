@@ -48,6 +48,58 @@ const newG = ref({ chat_id: '', title: '', branch_id: null as number | null })
 const addError = ref('')
 const adding = ref(false)
 
+// Seed-привязка группы (альтернатива ручному chat_id-вводу)
+const seedModal = ref(false)
+const seedName = ref('')
+const seedPhrase = ref('')
+const seedRegId = ref<number | null>(null)
+const seedError = ref('')
+const seedGenerating = ref(false)
+let seedPollTimer: ReturnType<typeof setInterval> | null = null
+
+function openSeed() {
+  seedModal.value = true
+  seedName.value = ''
+  seedPhrase.value = ''
+  seedRegId.value = null
+  seedError.value = ''
+}
+function closeSeed() {
+  seedModal.value = false
+  if (seedPollTimer) { clearInterval(seedPollTimer); seedPollTimer = null }
+}
+async function generateSeed() {
+  seedGenerating.value = true
+  seedError.value = ''
+  try {
+    const res = await api.post('/api/mailer/groups/registrations',
+                               { name: seedName.value.trim() || undefined }).then(r => r.data)
+    seedPhrase.value = res.phrase
+    seedRegId.value = res.id
+    if (seedPollTimer) clearInterval(seedPollTimer)
+    seedPollTimer = setInterval(pollSeed, 3000)
+  } catch (e: any) {
+    seedError.value = e?.response?.data?.error || e.message
+  } finally { seedGenerating.value = false }
+}
+async function pollSeed() {
+  if (!seedRegId.value) return
+  try {
+    const res = await api.get(`/api/mailer/groups/registrations/${seedRegId.value}`).then(r => r.data)
+    if (res.consumed_at && res.group?.id) {
+      await load()
+      closeSeed()
+      selectGroup(res.group.id)
+    } else if (res.expires_at && new Date(res.expires_at) < new Date()) {
+      seedError.value = 'Фраза просрочена. Попробуйте ещё раз.'
+      if (seedPollTimer) { clearInterval(seedPollTimer); seedPollTimer = null }
+    }
+  } catch { /* transient */ }
+}
+async function copySeed() {
+  try { await navigator.clipboard.writeText(seedPhrase.value) } catch { /* ignore */ }
+}
+
 async function load() {
   loading.value = true
   try {
@@ -137,6 +189,10 @@ onUpdated(() => nextTick(() => feather?.replace()))
         @update:search="(v: string) => search = v"
       >
         <template #primary>
+          <GhostBtn :disabled="!canManage()" @click="openSeed">
+            <i data-feather="key"></i>
+            Привязать через сообщение
+          </GhostBtn>
           <PrimaryBtn :disabled="!canManage()" @click="openAdd">Добавить группу</PrimaryBtn>
         </template>
       </PageHeader>
@@ -245,6 +301,57 @@ onUpdated(() => nextTick(() => feather?.replace()))
             {{ adding ? 'Добавляю…' : 'Добавить' }}
           </PrimaryBtn>
         </div>
+      </div>
+    </div>
+
+    <!-- Seed-фраза для привязки группы -->
+    <div v-if="seedModal" class="modal-bg" @click.self="closeSeed">
+      <div class="modal">
+        <h3 class="modal__title">Привязать группу через сообщение</h3>
+
+        <template v-if="!seedPhrase">
+          <p class="modal__hint">
+            Альтернатива ручному вводу <code>chat_id</code>. Бот должен уже быть в нужном
+            чате. После генерации фразы вы вставите её любым сообщением в чат —
+            бот распознает и зарегистрирует группу.
+          </p>
+          <div class="drawer-field">
+            <label class="drawer-field__label">Название группы (опц.)</label>
+            <input class="drawer-field__input" v-model="seedName"
+                   placeholder="Например, «Отдел продаж»" />
+            <div class="drawer-field__hint">Пусто — возьмём название чата из Telegram.</div>
+          </div>
+          <p v-if="seedError" class="modal__err">{{ seedError }}</p>
+          <div class="modal__actions">
+            <GhostBtn @click="closeSeed">Отмена</GhostBtn>
+            <PrimaryBtn :disabled="seedGenerating" @click="generateSeed">
+              {{ seedGenerating ? 'Генерирую…' : 'Сгенерировать фразу' }}
+            </PrimaryBtn>
+          </div>
+        </template>
+
+        <template v-else>
+          <div class="modal__step">Шаг 1 — скопируйте фразу:</div>
+          <div class="modal__phrase">
+            <code>{{ seedPhrase }}</code>
+            <button class="modal__copy" @click="copySeed" title="Скопировать">
+              <i data-feather="copy"></i>
+            </button>
+          </div>
+          <div class="modal__step">Шаг 2 — откройте нужный чат в Telegram, вставьте эту фразу сообщением:</div>
+          <p class="modal__hint">
+            Бот увидит сообщение → создаст группу с <code>chat_id</code> этого чата →
+            это окно закроется автоматически.
+          </p>
+          <div class="modal__waiting">
+            <i data-feather="loader" class="modal__spin"></i>
+            <span>Ждём бота…</span>
+          </div>
+          <p v-if="seedError" class="modal__err">{{ seedError }}</p>
+          <div class="modal__actions">
+            <GhostBtn @click="closeSeed">Отмена</GhostBtn>
+          </div>
+        </template>
       </div>
     </div>
   </div>
@@ -363,4 +470,37 @@ onUpdated(() => nextTick(() => feather?.replace()))
 .drawer-field__input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
 .drawer-field__input--mono { font-family: 'JetBrains Mono', monospace; }
 .drawer-field__hint { font-size: 11px; color: var(--text-4); }
+
+/* Seed-phrase wizard (одинаковый с RuleDetailPanel) */
+.modal__step { font-size: 12px; color: var(--text-3); margin-top: 12px; margin-bottom: 6px; }
+.modal__step:first-child { margin-top: 0; }
+.modal__phrase {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 14px;
+  background: var(--panel); border: 1px dashed var(--border-strong); border-radius: 9px;
+  font-family: 'JetBrains Mono', monospace; font-size: 14px;
+  color: var(--text); font-weight: 600;
+}
+.modal__phrase code { flex: 1; user-select: all; }
+.modal__copy {
+  width: 30px; height: 30px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--surface); color: var(--text-2); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal__copy:hover { background: var(--hover-bg); color: var(--text); }
+.modal__copy :deep(svg) { width: 14px; height: 14px; }
+.modal__hint { font-size: 12px; color: var(--text-3); line-height: 1.5; margin: 8px 0 12px; }
+.modal__hint code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--panel); padding: 1px 5px; border-radius: 4px;
+}
+.modal__waiting {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 12px;
+  background: var(--panel); border-radius: 8px;
+  font-size: 12px; color: var(--text-2);
+}
+.modal__waiting :deep(svg) { width: 14px; height: 14px; }
+.modal__spin :deep(svg) { animation: spin 1.2s linear infinite; }
+@keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 </style>
