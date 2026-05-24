@@ -431,7 +431,10 @@ async function copyPhrase() {
   width: 460px; flex-shrink: 0;
   background: var(--bg); border-left: 1px solid var(--border);
   display: flex; flex-direction: column; align-self: stretch;
-  overflow: auto; font-size: 13px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar, var(--border-strong)) transparent; font-size: 13px;
 }
 .dp__header {
   padding: 18px 22px 14px; border-bottom: 1px solid var(--border-2);
@@ -586,4 +589,13 @@ async function copyPhrase() {
   color: #b3261e; font-size: 12px;
 }
 .modal__actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+
+.dp::-webkit-scrollbar { width: 8px; }
+.dp::-webkit-scrollbar-track { background: transparent; }
+.dp::-webkit-scrollbar-thumb {
+  background: var(--scrollbar, var(--border-strong));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
 </style>

@@ -444,6 +444,9 @@ help: Справка"></textarea>
   display: flex; flex-direction: column;
   align-self: stretch;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar, var(--border-strong)) transparent;
   font-size: 13px;
 }
 
@@ -589,4 +592,13 @@ help: Справка"></textarea>
 .drawer-field__value--mono { font-family: 'JetBrains Mono', monospace; }
 .drawer-field__value--empty { color: var(--placeholder); }
 .drawer-field__hint { font-size: 11px; color: var(--text-4); }
+
+.dp::-webkit-scrollbar { width: 8px; }
+.dp::-webkit-scrollbar-track { background: transparent; }
+.dp::-webkit-scrollbar-thumb {
+  background: var(--scrollbar, var(--border-strong));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
 </style>

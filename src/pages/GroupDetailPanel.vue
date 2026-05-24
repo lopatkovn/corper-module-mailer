@@ -217,7 +217,10 @@ function fmtDate(d: string | null): string {
   width: 420px; flex-shrink: 0;
   background: var(--bg); border-left: 1px solid var(--border);
   display: flex; flex-direction: column; align-self: stretch;
-  overflow: auto; font-size: 13px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar, var(--border-strong)) transparent; font-size: 13px;
 }
 
 .dp__header {
@@ -300,4 +303,13 @@ function fmtDate(d: string | null): string {
 
 .drawer-field__hint { font-size: 11px; color: var(--text-4); }
 .drawer-field__hint code { font-family: 'JetBrains Mono', monospace; background: var(--panel); padding: 1px 4px; border-radius: 3px; color: var(--text); }
+
+.dp::-webkit-scrollbar { width: 8px; }
+.dp::-webkit-scrollbar-track { background: transparent; }
+.dp::-webkit-scrollbar-thumb {
+  background: var(--scrollbar, var(--border-strong));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
 </style>

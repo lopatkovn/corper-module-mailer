@@ -358,7 +358,13 @@ onUpdated(() => nextTick(() => feather?.replace()))
 </template>
 
 <style scoped>
-.page { display: flex; height: 100%; min-height: 100vh; background: var(--bg); }
+.page {
+  display: flex;
+  height: 100vh;
+  max-height: 100vh;
+  overflow: hidden;
+  background: var(--bg);
+}
 .page__main { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
 .page__empty {
   color: var(--text-4); text-align: center; padding: 60px 32px; font-size: 13px;
@@ -369,7 +375,11 @@ onUpdated(() => nextTick(() => feather?.replace()))
 .page__empty-hint strong { color: var(--text); }
 
 .page__grid {
-  flex: 1; overflow: auto;
+  flex: 1; overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar, var(--border-strong)) transparent;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 14px;
@@ -503,4 +513,13 @@ onUpdated(() => nextTick(() => feather?.replace()))
 .modal__waiting :deep(svg) { width: 14px; height: 14px; }
 .modal__spin :deep(svg) { animation: spin 1.2s linear infinite; }
 @keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+
+.page__grid::-webkit-scrollbar { width: 10px; }
+.page__grid::-webkit-scrollbar-track { background: transparent; }
+.page__grid::-webkit-scrollbar-thumb {
+  background: var(--scrollbar, var(--border-strong));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
 </style>

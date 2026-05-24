@@ -191,8 +191,9 @@ onUpdated(() => nextTick(() => feather?.replace()))
 <style scoped>
 .page {
   display: flex;
-  height: 100%;
-  min-height: 100vh;
+  height: 100vh;
+  max-height: 100vh;
+  overflow: hidden;
   background: var(--bg);
 }
 .page__main {
@@ -210,7 +211,11 @@ onUpdated(() => nextTick(() => feather?.replace()))
 
 .page__grid {
   flex: 1;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar, var(--border-strong)) transparent;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 14px;
@@ -365,4 +370,13 @@ onUpdated(() => nextTick(() => feather?.replace()))
 .badge--role          { background: var(--role-bg); color: var(--role-fg); }
 .badge--neutral       { background: var(--panel); color: var(--text-2); }
 .badge--status-error  { background: #fbe8e7; color: #b3261e; }
+
+.page__grid::-webkit-scrollbar { width: 10px; }
+.page__grid::-webkit-scrollbar-track { background: transparent; }
+.page__grid::-webkit-scrollbar-thumb {
+  background: var(--scrollbar, var(--border-strong));
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
 </style>
