@@ -1249,5 +1249,97 @@ def list_inbound():
                     "next_since_id": rows[-1].id if len(rows) == limit else None})
 
 
+# ── /admin/messages, /admin/inbound, /admin/events — system журнал ────────
+# Те же таблицы, что и company-scope, но company_id IS NULL и super_admin
+# guard. Используется AdminNotificationsPage для отображения «Системных
+# событий» (письма активации, magic-link, регистрации, входящие TG-сообщения
+# в системного бота). Возвращают тот же формат, что /messages, /inbound.
+
+@app.get("/admin/messages")
+@login_required
+def admin_list_messages():
+    err = _admin_or_403()
+    if err: return err
+    limit = max(1, min(_parse_int(request.args.get("limit"), 50) or 50, 200))
+    status = request.args.get("status")
+    kind = request.args.get("kind")
+    source_module = request.args.get("source_module")
+    since_id = _parse_int(request.args.get("since_id"), None)
+    q = Message.query.filter(Message.company_id.is_(None))
+    if status:
+        q = q.filter(Message.status == status)
+    if kind:
+        q = q.join(Channel, Channel.id == Message.channel_id).filter(Channel.kind == kind)
+    if source_module:
+        q = q.filter(Message.source_module == source_module)
+    if since_id:
+        q = q.filter(Message.id < since_id)
+    rows = q.order_by(Message.id.desc()).limit(limit).all()
+    return jsonify({"items": [_message_dict(m) for m in rows],
+                    "next_since_id": rows[-1].id if len(rows) == limit else None})
+
+
+@app.get("/admin/inbound")
+@login_required
+def admin_list_inbound():
+    err = _admin_or_403()
+    if err: return err
+    limit = max(1, min(_parse_int(request.args.get("limit"), 50) or 50, 200))
+    since_id = _parse_int(request.args.get("since_id"), None)
+    q = InboundMessage.query.filter(InboundMessage.company_id.is_(None))
+    if since_id:
+        q = q.filter(InboundMessage.id < since_id)
+    rows = q.order_by(InboundMessage.id.desc()).limit(limit).all()
+    return jsonify({"items": [_inbound_dict(i) for i in rows],
+                    "next_since_id": rows[-1].id if len(rows) == limit else None})
+
+
+@app.get("/admin/events")
+@login_required
+def admin_list_events():
+    """Объединённый журнал системных событий — outbound (Message)
+    + inbound (InboundMessage). Возвращает массив, отсортированный
+    по created_at DESC, с дискриминатором `direction`: 'outbound'|'inbound'.
+
+    Это удобный single-feed-источник для UI-таблицы «Системные события»:
+    пользователь видит всё подряд (письма + TG-сообщения), фильтрует
+    по `direction`, `status`, `kind`, `source_module`, `from`, `to`.
+    """
+    err = _admin_or_403()
+    if err: return err
+    limit = max(1, min(_parse_int(request.args.get("limit"), 50) or 50, 200))
+    direction = request.args.get("direction")          # 'outbound'|'inbound'|None
+    status = request.args.get("status")
+    kind = request.args.get("kind")                    # 'email'|'telegram'
+    source_module = request.args.get("source_module")
+
+    items = []
+    if direction != "inbound":
+        q_out = Message.query.filter(Message.company_id.is_(None))
+        if status:
+            q_out = q_out.filter(Message.status == status)
+        if kind:
+            q_out = q_out.join(Channel, Channel.id == Message.channel_id) \
+                          .filter(Channel.kind == kind)
+        if source_module:
+            q_out = q_out.filter(Message.source_module == source_module)
+        for m in q_out.order_by(Message.id.desc()).limit(limit).all():
+            d = _message_dict(m)
+            d["direction"] = "outbound"
+            items.append(d)
+    if direction != "outbound":
+        q_in = InboundMessage.query.filter(InboundMessage.company_id.is_(None))
+        for i in q_in.order_by(InboundMessage.id.desc()).limit(limit).all():
+            d = _inbound_dict(i)
+            d["direction"] = "inbound"
+            # Унификация status/kind для inbound: всегда 'received', kind='telegram'.
+            d["status"] = "received"
+            d["kind"] = "telegram"
+            items.append(d)
+    # Сортируем по created_at DESC (строки — ISO, сравниваемы лексикографически).
+    items.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    return jsonify({"items": items[:limit]})
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
