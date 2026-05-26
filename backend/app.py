@@ -18,6 +18,7 @@ from flask import Flask, jsonify, request, abort
 from flask_login import LoginManager, login_required, current_user
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import and_, or_
+from sqlalchemy.orm.attributes import flag_modified
 
 from corper_shared.auth import make_user_loader, make_request_loader, ProxyEmployee
 from corper_shared.service_client import CoreClient
@@ -344,9 +345,15 @@ def bot_check():
         c.last_test_error = str(e)
         db.session.commit()
         return jsonify({"ok": False, "error": str(e)}), 200
-    cfg["bot_id"] = info.get("id")
-    cfg["bot_username"] = info.get("username")
-    c.config = dict(cfg)
+    # SQLAlchemy не отслеживает in-place мутацию JSONB по умолчанию;
+    # без flag_modified изменения cfg не попадают в COMMIT — баг: после
+    # успешного getMe bot_id/username возвращались в response, но в БД
+    # не сохранялись, и фронт после await load() видел пустые поля.
+    new_cfg = dict(cfg)
+    new_cfg["bot_id"] = info.get("id")
+    new_cfg["bot_username"] = info.get("username")
+    c.config = new_cfg
+    flag_modified(c, "config")
     c.last_test_at = datetime.utcnow()
     c.last_test_ok = True
     c.last_test_error = None
@@ -1067,9 +1074,15 @@ def admin_bot_check():
         c.last_test_error = str(e)
         db.session.commit()
         return jsonify({"ok": False, "error": str(e)}), 200
-    cfg["bot_id"] = info.get("id")
-    cfg["bot_username"] = info.get("username")
-    c.config = dict(cfg)
+    # SQLAlchemy не отслеживает in-place мутацию JSONB по умолчанию;
+    # без flag_modified изменения cfg не попадают в COMMIT — баг: после
+    # успешного getMe bot_id/username возвращались в response, но в БД
+    # не сохранялись, и фронт после await load() видел пустые поля.
+    new_cfg = dict(cfg)
+    new_cfg["bot_id"] = info.get("id")
+    new_cfg["bot_username"] = info.get("username")
+    c.config = new_cfg
+    flag_modified(c, "config")
     c.last_test_at = datetime.utcnow()
     c.last_test_ok = True
     c.last_test_error = None
