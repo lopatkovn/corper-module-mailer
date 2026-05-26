@@ -1005,23 +1005,43 @@ def admin_put_channel(kind):
         c.is_enabled = bool(data["is_enabled"])
     if "label" in data:
         c.label = str(data.get("label") or "")[:120]
-    merged = dict(c.config or {})
+    old_cfg = dict(c.config or {})
+    merged = dict(old_cfg)
+    # Поля, изменение которых инвалидирует предыдущий getMe / SMTP-тест.
+    # Если эти ключи в PUT идентичны тому, что в БД (или просто не пришли),
+    # last_test_* сохраняем — иначе пользователь жалуется «после Save
+    # значок 'Не проверен', хотя только что Проверял».
     if kind == "email":
+        sensitive_keys = ("host", "port", "use_tls", "username", "sender_email")
         for k in ("host", "port", "use_tls", "username", "sender_name", "sender_email"):
             if k in cfg_in:
                 merged[k] = cfg_in[k]
         if "password" in cfg_in and cfg_in.get("password"):
             merged["password"] = cfg_in["password"]
     else:  # telegram
+        sensitive_keys = ()  # для TG только bot_token, проверяется отдельно
         for k in ("bot_username", "bot_id"):
             if k in cfg_in:
                 merged[k] = cfg_in[k]
         if "bot_token" in cfg_in and cfg_in.get("bot_token"):
             merged["bot_token"] = cfg_in["bot_token"]
     c.config = merged
-    c.last_test_at = None
-    c.last_test_ok = None
-    c.last_test_error = None
+    flag_modified(c, "config")
+    # Detect whether secrets/credentials actually changed.
+    creds_changed = False
+    if kind == "email":
+        for k in sensitive_keys:
+            if old_cfg.get(k) != merged.get(k):
+                creds_changed = True; break
+        if not creds_changed and cfg_in.get("password"):  # пришёл новый пароль
+            creds_changed = True
+    else:  # telegram
+        if cfg_in.get("bot_token") and cfg_in["bot_token"] != old_cfg.get("bot_token"):
+            creds_changed = True
+    if creds_changed:
+        c.last_test_at = None
+        c.last_test_ok = None
+        c.last_test_error = None
     db.session.commit()
     return jsonify({"id": c.id, "kind": c.kind, "is_enabled": c.is_enabled})
 
