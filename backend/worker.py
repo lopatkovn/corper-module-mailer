@@ -333,10 +333,20 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
 
         if resp.get("ok"):
             try:
+                # Два варианта входа в одном сообщении:
+                # 1) Кликабельная ссылка — обычный путь.
+                # 2) Моноширинный код (token) — tap в TG копирует, юзер
+                #    идёт на /login → «Войти по коду из Telegram» →
+                #    вставляет → submit ведёт на /auth/magic/<code>.
+                code = resp.get("magic_code") or ""
                 tg_send(
                     bot_token, chat["id"],
-                    text=(f"✓ Привязано к учётке <b>{resp.get('employee_name')}</b>.\n"
-                          f"Войти в портал: {resp.get('magic_url')}"),
+                    text=(
+                        f"✓ Привязано к учётке <b>{resp.get('employee_name')}</b>.\n\n"
+                        f"<b>Войти по ссылке:</b>\n{resp.get('magic_url')}\n\n"
+                        f"<b>Или скопируйте код и вставьте на странице входа:</b>\n"
+                        f"<code>{code}</code>"
+                    ),
                     reply_markup={"remove_keyboard": True},
                 )
             except TelegramError as e:
