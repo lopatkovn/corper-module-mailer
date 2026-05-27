@@ -969,6 +969,34 @@ def _system_channel_payload(c):
     }
 
 
+# ── Inter-service: send DM в системного бота ───────────────────────────
+#
+# Используется core-registry для login-flow: пользователь запросил
+# magic-link через /login → core генерирует MagicLinkToken и просит мейлер
+# доставить текст в private chat сотрудника. Без login_required —
+# доступ только внутренней Docker-сетью; nginx не публикует /admin/* мейлера.
+@app.post("/admin/send-dm")
+def admin_send_dm():
+    data = request.get_json(force=True) or {}
+    chat_id = data.get("chat_id")
+    text = data.get("text")
+    if not chat_id or not text:
+        return jsonify({"error": "chat_id and text required"}), 400
+    c = (Channel.query
+                 .filter(Channel.company_id.is_(None),
+                         Channel.kind == "telegram",
+                         Channel.is_enabled.is_(True))
+                 .first())
+    if not c or not (c.config or {}).get("bot_token"):
+        return jsonify({"error": "system bot not configured"}), 503
+    try:
+        from delivery_telegram import send_message as tg_send, TelegramError
+        result = tg_send(c.config["bot_token"], int(chat_id), text)
+        return jsonify({"ok": True, "message_id": result.get("message_id")})
+    except TelegramError as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+
 # ── Inter-service: bot-info для core-registry ──────────────────────────
 #
 # Возвращает {bot_username, bot_id} системного TG-канала. Без авторизации —
