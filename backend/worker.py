@@ -66,6 +66,7 @@ _shutdown = threading.Event()
 _rl = BotRateLimiter()
 
 OUTBOX_INTERVAL = 5             # сек между циклами потока A
+TEST_EVENT_MAX_ATTEMPTS = 1     # для test-каналов (_test.*) — одна попытка
 HEALTH_INTERVAL = 600           # 10 мин
 POLL_TIMEOUT_SEC = 25           # long polling getUpdates timeout
 MAX_ATTEMPTS = 5                # после стольких неудач → status=failed
@@ -144,11 +145,19 @@ def _process_pending_mailer_messages() -> None:
             err = str(e)
             m.attempts = (m.attempts or 0) + 1
             m.last_error = err
+            # Для test-событий (_test.email / _test.telegram) — failed сразу
+            # после первой попытки. Пользователь жмёт «Отправить тест» и ждёт
+            # ответ в течение секунд — нет смысла ретраить 5 раз, каждый
+            # упрётся в тот же TLS-timeout 30s; в сумме «отправка» висит ~3
+            # минуты вместо мгновенного фидбэка.
+            max_attempts = (TEST_EVENT_MAX_ATTEMPTS
+                            if m.event_type and m.event_type.startswith("_test.")
+                            else MAX_ATTEMPTS)
             if err == "rate_limited":
                 # просто откатываем в pending — без увеличения attempts
                 m.attempts = max(0, (m.attempts or 0) - 1)
                 m.status = "pending"
-            elif m.attempts >= MAX_ATTEMPTS:
+            elif m.attempts >= max_attempts:
                 m.status = "failed"
             else:
                 m.status = "pending"
