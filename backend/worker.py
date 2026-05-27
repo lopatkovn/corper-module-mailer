@@ -290,7 +290,11 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
     if not bot_token:
         return
 
-    if text == "/start":
+    # Принимаем /start как с payload'ом, так и без. Payload приходит из
+    # deep-link'ов вида https://t.me/<bot>?start=login (из /login →
+    # Telegram-вкладка) или ?start=<custom>. Сам payload пока не нужен —
+    # любой вариант кикает off contact-share flow.
+    if text == "/start" or text.startswith("/start "):
         try:
             tg_send(
                 bot_token, chat["id"],
