@@ -298,8 +298,13 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
         try:
             tg_send(
                 bot_token, chat["id"],
-                text=("Здравствуйте! Чтобы привязать учётку портала, "
-                      "поделитесь номером телефона — кнопка ниже."),
+                text=(
+                    "👋 <b>Привет! Это CORPER.</b>\n\n"
+                    "Чтобы войти в портал, мне нужен ваш номер телефона "
+                    "— по нему я найду вашу учётную запись.\n\n"
+                    "Нажмите кнопку <b>«📞 Поделиться номером»</b> ниже — "
+                    "Telegram передаст его автоматически."
+                ),
                 reply_markup={
                     "keyboard": [[{"text": "📞 Поделиться номером",
                                     "request_contact": True}]],
@@ -337,19 +342,37 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
 
         if resp.get("ok"):
             try:
-                # Два варианта входа в одном сообщении:
-                # 1) Кликабельная ссылка — обычный путь.
-                # 2) Моноширинный код (token) — tap в TG копирует, юзер
-                #    идёт на /login → «Войти по коду из Telegram» →
-                #    вставляет → submit ведёт на /auth/magic/<code>.
+                # Дифференцируем «активация» / «повторный вход»:
+                #   was_activated=True  → онбординг (welcome + intro)
+                #   was_activated=False → лаконичное «ваша ссылка для входа»
+                # Имя берём first-name по пробелу — чтобы обращение было личным.
+                name_full = (resp.get("employee_name") or "").strip()
+                first_name = name_full.split()[0] if name_full else ""
+                greeting_name = f", {first_name}" if first_name else ""
+                if resp.get("was_activated"):
+                    header = (f"🎉 <b>Добро пожаловать в CORPER{greeting_name}!</b>")
+                    intro = (
+                        "Учётная запись успешно привязана и активирована.\n"
+                        "Откройте портал по этой ссылке — она сразу выполнит вход."
+                    )
+                else:
+                    header = f"🔐 <b>Вход в портал{greeting_name}</b>"
+                    intro = (
+                        "Telegram привязан к вашей учётной записи.\n"
+                        "Ваша одноразовая ссылка для входа готова."
+                    )
                 code = resp.get("magic_code") or ""
                 tg_send(
                     bot_token, chat["id"],
                     text=(
-                        f"✓ Привязано к учётке <b>{resp.get('employee_name')}</b>.\n\n"
-                        f"<b>Войти по ссылке:</b>\n{resp.get('magic_url')}\n\n"
-                        f"<b>Или скопируйте код и вставьте на странице входа:</b>\n"
-                        f"<code>{code}</code>"
+                        f"{header}\n\n"
+                        f"{intro}\n\n"
+                        f"🔗 <a href=\"{resp.get('magic_url')}\">Войти в портал</a>\n\n"
+                        f"<i>или скопируйте код (нажмите, чтобы выделить):</i>\n"
+                        f"<code>{code}</code>\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⏱ Действует <b>15 минут</b>\n"
+                        f"🛡 Если вы не запрашивали вход — просто проигнорируйте это сообщение."
                     ),
                     reply_markup={"remove_keyboard": True},
                 )
