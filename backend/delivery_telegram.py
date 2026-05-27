@@ -49,11 +49,14 @@ def get_me(bot_token: str) -> dict:
 def send_message(bot_token: str, chat_id: int | str, text: str,
                  reply_to_message_id: int | None = None,
                  message_thread_id: int | None = None,
+                 reply_markup: dict | None = None,
                  parse_mode: str = "HTML") -> dict:
     """sendMessage → {message_id, chat, ...}
 
     `message_thread_id` — для форум-чатов: указывает в какой топик отправить.
     None — общее сообщение (без треда).
+    `reply_markup` — keyboard / inline-keyboard / ForceReply / ReplyKeyboardRemove.
+    Используется в TG-регистрации для request_contact keyboard'а.
     """
     payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
                      "disable_web_page_preview": True}
@@ -61,6 +64,8 @@ def send_message(bot_token: str, chat_id: int | str, text: str,
         payload["reply_to_message_id"] = reply_to_message_id
     if message_thread_id is not None:
         payload["message_thread_id"] = int(message_thread_id)
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     return _request(bot_token, "sendMessage", **payload)
 
 

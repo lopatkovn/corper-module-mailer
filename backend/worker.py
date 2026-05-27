@@ -25,6 +25,8 @@ import threading
 import time
 from datetime import datetime
 
+import requests
+
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 
@@ -276,6 +278,87 @@ def _ensure_poll_state(channel_id: int) -> PollState:
     return st
 
 
+def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
+    """Системный бот в личке: `/start` → keyboard с request_contact,
+    contact-share → core-registry /telegram/link-and-magic для линка
+    Employee и выдачи magic-link'а. Прочие сообщения игнорируем.
+    """
+    from_user = msg.get("from") or {}
+    text = (msg.get("text") or "").strip()
+    contact = msg.get("contact") or None
+    bot_token = (ch.config or {}).get("bot_token")
+    if not bot_token:
+        return
+
+    if text == "/start":
+        try:
+            tg_send(
+                bot_token, chat["id"],
+                text=("Здравствуйте! Чтобы привязать учётку портала, "
+                      "поделитесь номером телефона — кнопка ниже."),
+                reply_markup={
+                    "keyboard": [[{"text": "📞 Поделиться номером",
+                                    "request_contact": True}]],
+                    "resize_keyboard": True, "one_time_keyboard": True,
+                },
+            )
+        except TelegramError as e:
+            log.error("tg /start send failed chat=%s: %s", chat.get("id"), e)
+        return
+
+    if contact:
+        phone = contact.get("phone_number")
+        core_url = os.environ.get("CORE_REGISTRY_URL", "http://core-registry:5001")
+        try:
+            r = requests.post(
+                f"{core_url}/telegram/link-and-magic",
+                json={
+                    "phone_number": phone,
+                    "tg_user_id": from_user.get("id"),
+                    "tg_username": from_user.get("username"),
+                    "tg_chat_id": chat.get("id"),
+                },
+                timeout=10,
+            )
+            resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        except Exception as e:
+            log.error("link-and-magic call failed: %s", e)
+            try:
+                tg_send(bot_token, chat["id"],
+                        text="⚠ Временная ошибка. Попробуйте позже.",
+                        reply_markup={"remove_keyboard": True})
+            except TelegramError:
+                pass
+            return
+
+        if resp.get("ok"):
+            try:
+                tg_send(
+                    bot_token, chat["id"],
+                    text=(f"✓ Привязано к учётке <b>{resp.get('employee_name')}</b>.\n"
+                          f"Войти в портал: {resp.get('magic_url')}"),
+                    reply_markup={"remove_keyboard": True},
+                )
+            except TelegramError as e:
+                log.error("tg success send failed: %s", e)
+        else:
+            err_code = resp.get("error") or "unknown"
+            human = {
+                "phone_not_registered": (
+                    "❌ Этот номер не зарегистрирован в портале. "
+                    "Обратитесь к администратору компании."
+                ),
+                "phone_invalid": "❌ Номер телефона некорректен.",
+            }.get(err_code, f"❌ Ошибка: {err_code}")
+            try:
+                tg_send(bot_token, chat["id"], text=human,
+                        reply_markup={"remove_keyboard": True})
+            except TelegramError:
+                pass
+        return
+    # Прочие private-сообщения молча игнорируем (фаза 6 — DM-команды).
+
+
 def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
     from models import InboundMessage  # локальный import — модель здесь нужна
 
@@ -315,9 +398,16 @@ def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
         return
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-    if chat_id is None or chat.get("type") == "private":
-        # личные сообщения — пишем как inbound, но без company-привязки если нет группы;
-        # пока что игнорируем (фаза 6 — команды и DM-сценарии)
+    if chat_id is None:
+        return
+    # ── Private (DM с ботом) — TG-регистрация портала ─────────────────
+    # Только для system-канала (ch.company_id IS NULL): /start приветствие
+    # + request_contact keyboard, contact-share → POST в core-registry для
+    # привязки tg_user_id ↔ Employee и magic-link для входа в портал.
+    if chat.get("type") == "private":
+        if ch.company_id is not None:
+            return  # company-боты пока не обслуживают регистрацию
+        _handle_private_dm(ch, msg, chat)
         return
 
     from_user = msg.get("from") or {}

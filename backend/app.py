@@ -969,6 +969,27 @@ def _system_channel_payload(c):
     }
 
 
+# ── Inter-service: bot-info для core-registry ──────────────────────────
+#
+# Возвращает {bot_username, bot_id} системного TG-канала. Без авторизации —
+# вызывается только изнутри Docker-сети (corper_internal). Используется
+# core-registry для генерации deep-url'а на бота при method=telegram.
+@app.get("/admin/bot/info")
+def admin_bot_info():
+    c = (Channel.query
+                 .filter(Channel.company_id.is_(None),
+                         Channel.kind == "telegram",
+                         Channel.is_enabled.is_(True))
+                 .first())
+    if not c:
+        return jsonify({"error": "bot_not_configured"}), 503
+    cfg = c.config or {}
+    if not cfg.get("bot_username"):
+        return jsonify({"error": "bot_username_missing — нажмите «Проверить бота»"}), 503
+    return jsonify({"bot_username": cfg["bot_username"],
+                    "bot_id": cfg.get("bot_id")})
+
+
 @app.get("/admin/channels")
 @login_required
 def admin_list_channels():
