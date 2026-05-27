@@ -278,6 +278,40 @@ def _ensure_poll_state(channel_id: int) -> PollState:
     return st
 
 
+def _dm_with_log(ch: Channel, bot_token: str, chat_id, text: str,
+                 *, event_type: str, source_module: str = "auth",
+                 reply_markup=None) -> bool:
+    """Отправить TG-сообщение + записать в Message-журнал.
+
+    Пишем запись ДО fact-of-send, чтобы при сбое осталась строка с
+    status='failed' + last_error — иначе админ в /admin/notifications
+    не увидит что бот пытался отправить и почему упало. Возвращает
+    True/False по успешности (только informational — caller обычно
+    игнорирует).
+    """
+    m = Message(
+        company_id=None, channel_id=ch.id,
+        source_module=source_module, event_type=event_type,
+        payload={"chat_id": int(chat_id)},
+        to_address=str(chat_id), subject=None, body_text=text,
+        status="sending", attempts=1,
+    )
+    db.session.add(m)
+    db.session.commit()
+    try:
+        tg_send(bot_token, chat_id, text=text, reply_markup=reply_markup)
+        m.status = "sent"
+        m.sent_at = datetime.utcnow()
+        db.session.commit()
+        return True
+    except TelegramError as e:
+        log.error("tg send (event=%s) failed chat=%s: %s", event_type, chat_id, e)
+        m.status = "failed"
+        m.last_error = str(e)[:1000]
+        db.session.commit()
+        return False
+
+
 def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
     """Системный бот в личке: `/start` → keyboard с request_contact,
     contact-share → core-registry /telegram/link-and-magic для линка
@@ -295,24 +329,22 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
     # Telegram-вкладка) или ?start=<custom>. Сам payload пока не нужен —
     # любой вариант кикает off contact-share flow.
     if text == "/start" or text.startswith("/start "):
-        try:
-            tg_send(
-                bot_token, chat["id"],
-                text=(
-                    "👋 <b>Привет! Это CORPER.</b>\n\n"
-                    "Чтобы войти в портал, мне нужен ваш номер телефона "
-                    "— по нему я найду вашу учётную запись.\n\n"
-                    "Нажмите кнопку <b>«📞 Поделиться номером»</b> ниже — "
-                    "Telegram передаст его автоматически."
-                ),
-                reply_markup={
-                    "keyboard": [[{"text": "📞 Поделиться номером",
-                                    "request_contact": True}]],
-                    "resize_keyboard": True, "one_time_keyboard": True,
-                },
-            )
-        except TelegramError as e:
-            log.error("tg /start send failed chat=%s: %s", chat.get("id"), e)
+        _dm_with_log(
+            ch, bot_token, chat["id"],
+            text=(
+                "👋 <b>Привет! Это CORPER.</b>\n\n"
+                "Чтобы войти в портал, мне нужен ваш номер телефона "
+                "— по нему я найду вашу учётную запись.\n\n"
+                "Нажмите кнопку <b>«📞 Поделиться номером»</b> ниже — "
+                "Telegram передаст его автоматически."
+            ),
+            event_type="auth.start",
+            reply_markup={
+                "keyboard": [[{"text": "📞 Поделиться номером",
+                                "request_contact": True}]],
+                "resize_keyboard": True, "one_time_keyboard": True,
+            },
+        )
         return
 
     if contact:
@@ -332,52 +364,52 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
             resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
         except Exception as e:
             log.error("link-and-magic call failed: %s", e)
-            try:
-                tg_send(bot_token, chat["id"],
-                        text="⚠ Временная ошибка. Попробуйте позже.",
-                        reply_markup={"remove_keyboard": True})
-            except TelegramError:
-                pass
+            _dm_with_log(
+                ch, bot_token, chat["id"],
+                text="⚠ Временная ошибка. Попробуйте позже.",
+                event_type="auth.link_and_magic_error",
+                reply_markup={"remove_keyboard": True},
+            )
             return
 
         if resp.get("ok"):
-            try:
-                # Дифференцируем «активация» / «повторный вход»:
-                #   was_activated=True  → онбординг (welcome + intro)
-                #   was_activated=False → лаконичное «ваша ссылка для входа»
-                # Имя берём first-name по пробелу — чтобы обращение было личным.
-                name_full = (resp.get("employee_name") or "").strip()
-                first_name = name_full.split()[0] if name_full else ""
-                greeting_name = f", {first_name}" if first_name else ""
-                if resp.get("was_activated"):
-                    header = (f"🎉 <b>Добро пожаловать в CORPER{greeting_name}!</b>")
-                    intro = (
-                        "Учётная запись успешно привязана и активирована.\n"
-                        "Откройте портал по этой ссылке — она сразу выполнит вход."
-                    )
-                else:
-                    header = f"🔐 <b>Вход в портал{greeting_name}</b>"
-                    intro = (
-                        "Telegram привязан к вашей учётной записи.\n"
-                        "Ваша одноразовая ссылка для входа готова."
-                    )
-                code = resp.get("magic_code") or ""
-                tg_send(
-                    bot_token, chat["id"],
-                    text=(
-                        f"{header}\n\n"
-                        f"{intro}\n\n"
-                        f"🔗 <a href=\"{resp.get('magic_url')}\">Войти в портал</a>\n\n"
-                        f"<i>или скопируйте код (нажмите, чтобы выделить):</i>\n"
-                        f"<code>{code}</code>\n\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"⏱ Действует <b>15 минут</b>\n"
-                        f"🛡 Если вы не запрашивали вход — просто проигнорируйте это сообщение."
-                    ),
-                    reply_markup={"remove_keyboard": True},
+            # Дифференцируем «активация» / «повторный вход»:
+            #   was_activated=True  → онбординг (welcome + intro)
+            #   was_activated=False → лаконичное «ваша ссылка для входа»
+            # Имя берём first-name по пробелу — чтобы обращение было личным.
+            name_full = (resp.get("employee_name") or "").strip()
+            first_name = name_full.split()[0] if name_full else ""
+            greeting_name = f", {first_name}" if first_name else ""
+            if resp.get("was_activated"):
+                header = (f"🎉 <b>Добро пожаловать в CORPER{greeting_name}!</b>")
+                intro = (
+                    "Учётная запись успешно привязана и активирована.\n"
+                    "Откройте портал по этой ссылке — она сразу выполнит вход."
                 )
-            except TelegramError as e:
-                log.error("tg success send failed: %s", e)
+                event_type = "auth.welcome_magic_link"
+            else:
+                header = f"🔐 <b>Вход в портал{greeting_name}</b>"
+                intro = (
+                    "Telegram привязан к вашей учётной записи.\n"
+                    "Ваша одноразовая ссылка для входа готова."
+                )
+                event_type = "auth.magic_link"
+            code = resp.get("magic_code") or ""
+            _dm_with_log(
+                ch, bot_token, chat["id"],
+                text=(
+                    f"{header}\n\n"
+                    f"{intro}\n\n"
+                    f"🔗 <a href=\"{resp.get('magic_url')}\">Войти в портал</a>\n\n"
+                    f"<i>или скопируйте код (нажмите, чтобы выделить):</i>\n"
+                    f"<code>{code}</code>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏱ Действует <b>15 минут</b>\n"
+                    f"🛡 Если вы не запрашивали вход — просто проигнорируйте это сообщение."
+                ),
+                event_type=event_type,
+                reply_markup={"remove_keyboard": True},
+            )
         else:
             err_code = resp.get("error") or "unknown"
             human = {
@@ -387,11 +419,11 @@ def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
                 ),
                 "phone_invalid": "❌ Номер телефона некорректен.",
             }.get(err_code, f"❌ Ошибка: {err_code}")
-            try:
-                tg_send(bot_token, chat["id"], text=human,
-                        reply_markup={"remove_keyboard": True})
-            except TelegramError:
-                pass
+            _dm_with_log(
+                ch, bot_token, chat["id"], text=human,
+                event_type=f"auth.phone_error.{err_code}",
+                reply_markup={"remove_keyboard": True},
+            )
         return
     # Прочие private-сообщения молча игнорируем (фаза 6 — DM-команды).
 

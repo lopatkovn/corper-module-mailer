@@ -977,6 +977,13 @@ def _system_channel_payload(c):
 # доступ только внутренней Docker-сетью; nginx не публикует /admin/* мейлера.
 @app.post("/admin/send-dm")
 def admin_send_dm():
+    """Отправить TG-сообщение в private chat + записать в журнал Message.
+
+    Пишем Message ДО tg_send, чтобы при сбое запись осталась со
+    status='failed' + last_error — иначе админ в /admin/notifications
+    не увидит что произошло. event_type='auth.magic_link' позволит
+    отличить эту строку в feed'е (когда понадобится фильтрация).
+    """
     data = request.get_json(force=True) or {}
     chat_id = data.get("chat_id")
     text = data.get("text")
@@ -989,11 +996,34 @@ def admin_send_dm():
                  .first())
     if not c or not (c.config or {}).get("bot_token"):
         return jsonify({"error": "system bot not configured"}), 503
+
+    # Журнальная запись — видна в /admin/notifications «Системные события».
+    msg = Message(
+        company_id=None,
+        channel_id=c.id,
+        source_module=data.get("source_module") or "auth",
+        event_type=data.get("event_type") or "auth.magic_link",
+        payload={"chat_id": int(chat_id)},
+        to_address=str(chat_id),
+        subject=None,
+        body_text=text,
+        status="sending",
+        attempts=1,
+    )
+    db.session.add(msg)
+    db.session.commit()
+
     try:
         from delivery_telegram import send_message as tg_send, TelegramError
         result = tg_send(c.config["bot_token"], int(chat_id), text)
+        msg.status = "sent"
+        msg.sent_at = datetime.utcnow()
+        db.session.commit()
         return jsonify({"ok": True, "message_id": result.get("message_id")})
     except TelegramError as e:
+        msg.status = "failed"
+        msg.last_error = str(e)[:1000]
+        db.session.commit()
         return jsonify({"ok": False, "error": str(e)}), 502
 
 
