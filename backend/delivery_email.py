@@ -66,12 +66,20 @@ def send_email(*, to_addr: str, subject: str, body_text: str,
     if not sender_email:
         raise SMTPError("sender_email не задан")
 
-    # Auto-fix: порт 465 — это SMTPS-only (implicit TLS), без TLS hand-shake
-    # клиент шлёт plain SMTP, сервер ждёт TLS hello → deadlock → timeout.
-    # Включаем use_tls для 465 принудительно. Логируем чтобы было видно
-    # в диагностике (админ забыл галочку — но мы не ругаемся, исправляем).
+    # Auto-fix по порту:
+    # - 465: SMTPS-only (implicit TLS). Без TLS hand-shake клиент шлёт
+    #   plain SMTP, сервер ждёт TLS hello → deadlock → timeout. Включаем
+    #   use_tls.
+    # - 587 (submission): по RFC 6409 это STARTTLS-порт. Подавляющее
+    #   большинство SMTP-серверов отказывают AUTH в plaintext на 587 и
+    #   ждут STARTTLS. Включаем use_tls по умолчанию — иначе пользователь
+    #   получает SMTPAuthenticationError 530 «Must issue a STARTTLS first».
+    # Это безопасно: STARTTLS использует тот же TCP-сеанс, не меняет порт.
     if port == 465 and not use_tls:
         log.info("auto-enabling TLS for port 465 (implicit SMTPS)")
+        use_tls = True
+    elif port == 587 and not use_tls:
+        log.info("auto-enabling STARTTLS for port 587 (submission)")
         use_tls = True
 
     log.info("smtp connect host=%s port=%s tls=%s user=%s",
