@@ -10,6 +10,9 @@
                     обрабатывает my_chat_member (auto-discovery групп) и
                     inbound сообщения (replies + команды).
   C — health-check: раз в 10 мин getChatMember(bot) → is_member/can_send.
+  D — трек писем: раз в минуту ищет застрявшие в core.mail_queue и разбирает
+              возвраты из почтового ящика отправителя; тревожит super_admin
+              в Telegram (см. mail_watch.py).
 
 Env:
   DATABASE_URL          — pg-mailer (как у backend'а)
@@ -51,12 +54,15 @@ from delivery_telegram import (  # noqa: E402
     TelegramError,
 )
 from rate_limit import BotRateLimiter  # noqa: E402
+import mail_watch  # noqa: E402  — сторож застрявших писем и разбор возвратов
 
 log = logging.getLogger("mailer-worker")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+
 
 app = backend_app.app
 db = backend_app.db
@@ -171,52 +177,118 @@ def _process_pending_mailer_messages() -> None:
             log.warning("send failed id=%s attempts=%s err=%s", m.id, m.attempts, err)
 
 
+def _core_smtp_cfg() -> dict | None:
+    """SMTP-конфиг системных писем из core.mail_settings (pg-core).
+
+    Source of truth перенесён в core (модуль mailer архивирован, его админ-UI
+    недоступен; системный SMTP редактируется в /admin/notifications → core).
+    Возвращает smtp_cfg-совместимый dict или None, если в core не настроено —
+    тогда fallback на legacy system-канал из pg-mailer.
+    """
+    if _core_engine is None:
+        return None
+    from sqlalchemy import text as sql_text
+    try:
+        with _core_engine.connect() as conn:
+            row = conn.execute(sql_text(
+                "SELECT server, port, use_tls, username, password, sender_name, is_enabled "
+                "FROM core.mail_settings ORDER BY id LIMIT 1")).mappings().first()
+    except Exception as e:
+        log.warning("core.mail_settings read failed: %s", e)
+        return None
+    if not row or not row["is_enabled"] or not row["server"] or not row["password"]:
+        return None
+    return {
+        "host": row["server"], "port": row["port"] or 587,
+        "use_tls": bool(row["use_tls"]),
+        "username": row["username"] or "", "password": row["password"],
+        "sender_name": row["sender_name"] or "",
+        "sender_email": row["username"] or "",
+    }
+
+
 def _process_legacy_mail_queue() -> None:
     """Bridge для core.mail_queue (заменяет notify-service).
 
-    Берёт по 20 pending, отправляет через дефолтный SMTP-канал ПЕРВОЙ компании,
-    у которой email-канал включён. Это упрощение — старые письма из mail_queue
-    не привязаны к company_id, поэтому используем любой готовый канал.
+    Берёт по 20 pending. SMTP-конфиг: приоритет — core.mail_settings
+    (редактируется в /admin/notifications, source of truth в core);
+    fallback — legacy system-канал из pg-mailer (company_id IS NULL),
+    затем любой включённый.
+
+    Параллельно создаёт mailer.message запись для каждой попытки — чтобы
+    письма были видны в /admin/notifications (раньше там были только
+    письма, отправленные через mailer-API напрямую).
     """
     if _core_engine is None:
         return
-    # Найти любой включённый email-канал (для отправки legacy писем)
+    core_cfg = _core_smtp_cfg()
+    # Системный канал (company_id IS NULL) — для журнала-mirror и как fallback.
     default_ch = (Channel.query
-                  .filter(Channel.kind == "email", Channel.is_enabled.is_(True))
+                  .filter(Channel.kind == "email", Channel.is_enabled.is_(True),
+                          Channel.company_id.is_(None))
                   .order_by(Channel.id.asc()).first())
     if default_ch is None:
-        return  # некуда слать — старые письма ждут настройки канала
+        default_ch = (Channel.query
+                      .filter(Channel.kind == "email", Channel.is_enabled.is_(True))
+                      .order_by(Channel.id.asc()).first())
+    if core_cfg is None and default_ch is None:
+        return  # некуда слать — старые письма ждут настройки SMTP
 
-    smtp_cfg = default_ch.config or {}
+    smtp_cfg = core_cfg or (default_ch.config or {})
     from sqlalchemy import text as sql_text
     with _core_engine.begin() as conn:
         # Только pending, у которых last_attempt_at NULL или старше 60с —
         # чтобы не молотить SMTP при перманентной ошибке (DNS, креды).
         rows = conn.execute(sql_text(
-            "SELECT id, to_addr, subject, body FROM core.mail_queue "
+            "SELECT id, to_addr, subject, body, body_html FROM core.mail_queue "
             "WHERE status='pending' "
             "  AND (last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '60 seconds') "
             "ORDER BY created_at ASC LIMIT 20 FOR UPDATE SKIP LOCKED"
         )).mappings().all()
         for row in rows:
+            # Mirror в mailer.message для /admin/notifications. status='sending'
+            # до фактической попытки → 'sent' / 'failed' после.
+            from models import Message  # локальный import — модель только здесь нужна
+            mirror = Message(
+                company_id=None,
+                channel_id=default_ch.id if default_ch else None,
+                source_module="core.mail_queue",
+                event_type="legacy.bridge",
+                payload={"core_mail_queue_id": row["id"]},
+                to_address=row["to_addr"],
+                subject=row["subject"] or "(без темы)",
+                body_text=row["body"] or "",
+                status="sending", attempts=1,
+            )
+            db.session.add(mirror)
+            db.session.commit()
             try:
-                send_email(
+                trace = send_email(
                     to_addr=row["to_addr"],
                     subject=row["subject"] or "(без темы)",
                     body_text=row["body"] or "",
-                    body_html=None,
+                    body_html=row.get("body_html"),
                     smtp_cfg=smtp_cfg,
                 )
+                # Записываем след: по Message-ID к письму привяжется возврат,
+                # по квитанции релея его найдёт поддержка хостера.
                 conn.execute(sql_text(
-                    "UPDATE core.mail_queue SET status='sent', last_attempt_at=NOW() "
-                    "WHERE id=:i"), {"i": row["id"]})
+                    "UPDATE core.mail_queue SET status='sent', last_attempt_at=NOW(), "
+                    "  sent_at=NOW(), message_id=:mid, relay_receipt=:rcpt "
+                    "WHERE id=:i"),
+                    {"i": row["id"], "mid": (trace or {}).get("message_id"),
+                     "rcpt": (trace or {}).get("receipt")})
+                mirror.status = "sent"
+                mirror.sent_at = datetime.utcnow()
+                db.session.commit()
                 log.info("legacy mail_queue id=%s sent to=%s", row["id"], row["to_addr"])
             except SMTPError as e:
-                # Оставляем pending — будет ретрай через 60с. Только last_attempt_at
-                # и error_text. (notify-service вёл себя так же: бесконечный ретрай.)
                 conn.execute(sql_text(
                     "UPDATE core.mail_queue SET last_attempt_at=NOW(), error_text=:e WHERE id=:i"),
                     {"e": str(e)[:500], "i": row["id"]})
+                mirror.status = "failed"
+                mirror.last_error = str(e)[:1000]
+                db.session.commit()
                 log.warning("legacy mail_queue id=%s pending-retry err=%s", row["id"], e)
 
 
@@ -249,6 +321,68 @@ def _check_telegram_group(g: TelegramGroup, ch_cfg: dict, bot_id: int) -> None:
         g.can_send = False
         g.last_seen_at = datetime.utcnow()
         log.warning("group health-check chat_id=%s failed: %s", g.chat_id, e)
+
+
+# Как часто смотрим за судьбой писем: раз в минуту хватает — сторож считает
+# застрявшими те, что висят дольше 10 минут, а возвраты приходят не чаще.
+MAILWATCH_INTERVAL = 60
+
+
+def _system_bot_token() -> str | None:
+    """Токен системного бота: тревоги шлём им, а не ботом компании."""
+    ch = (Channel.query
+          .filter(Channel.kind == "telegram", Channel.is_enabled.is_(True),
+                  Channel.company_id.is_(None))
+          .order_by(Channel.id.asc()).first())
+    return ((ch.config or {}).get("bot_token") if ch else None) or None
+
+
+def _imap_overrides() -> dict:
+    """Явные настройки IMAP из platform_setting, если хостер держит его отдельно."""
+    if _core_engine is None:
+        return {}
+    from sqlalchemy import text as sql_text
+    try:
+        with _core_engine.connect() as conn:
+            rows = conn.execute(sql_text(
+                "SELECT key, value FROM core.platform_setting "
+                "WHERE key IN ('mail_imap_host','mail_imap_port')")).mappings().all()
+    except Exception:
+        return {}
+    out = {}
+    for r in rows:
+        if r["key"] == "mail_imap_host" and (r["value"] or "").strip():
+            out["host"] = r["value"].strip()
+        if r["key"] == "mail_imap_port" and str(r["value"] or "").strip().isdigit():
+            out["port"] = int(r["value"])
+    return out
+
+
+def thread_d_mailwatch():
+    """Трек писем: застрявшие в очереди и вернувшиеся от чужих серверов.
+
+    Отдельный поток, а не довесок к outbox: разбор ящика ходит по IMAP и может
+    висеть на таймауте, а отправка писем из-за этого останавливаться не должна.
+    """
+    log.info("thread D (mailwatch) started")
+    while not _shutdown.is_set():
+        with app.app_context():
+            try:
+                token = _system_bot_token()
+
+                def notify(text: str) -> None:
+                    mail_watch.alert_admins(_core_engine, tg_send, token, text)
+
+                mail_watch.check_stuck(_core_engine, notify)
+                smtp_cfg = _core_smtp_cfg() or {}
+                if smtp_cfg:
+                    mail_watch.poll_bounces(
+                        _core_engine,
+                        mail_watch.imap_cfg_from_smtp(smtp_cfg, _imap_overrides()),
+                        notify)
+            except Exception as e:
+                log.exception("mailwatch loop error: %s", e)
+        _shutdown.wait(MAILWATCH_INTERVAL)
 
 
 def thread_c_health():
@@ -321,120 +455,157 @@ def _dm_with_log(ch: Channel, bot_token: str, chat_id, text: str,
         return False
 
 
+def _reply_magic_link(ch: Channel, bot_token: str, chat_id, resp: dict,
+                      *, event_type: str, header: str, intro: str) -> None:
+    """Унифицированный шаблон ответа бота с magic-link (header + intro +
+    <code>token</code> + inline-кнопка URL). Используется в обоих flows
+    (Quick login и First-time link)."""
+    code = resp.get("magic_code") or ""
+    magic_url = resp.get("magic_url") or ""
+    text_body = (
+        f"{header}\n\n"
+        f"{intro}\n\n"
+        f"<i>Код для ручного входа (нажмите, чтобы выделить):</i>\n"
+        f"<code>{code}</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Действует <b>15 минут</b>\n"
+        f"🛡 Если вы не запрашивали вход — просто проигнорируйте это сообщение."
+    )
+    _dm_with_log(
+        ch, bot_token, chat_id,
+        text=text_body,
+        event_type=event_type,
+        reply_markup={
+            "inline_keyboard": [[
+                {"text": "🔗 Войти в портал", "url": magic_url}
+            ]]
+        },
+    )
+
+
+def _greeting_for(resp: dict) -> str:
+    """Из ответа core возьмём first-name для персонального обращения."""
+    name_full = (resp.get("employee_name") or "").strip()
+    first_name = name_full.split()[0] if name_full else ""
+    return f", {first_name}" if first_name else ""
+
+
 def _handle_private_dm(ch: Channel, msg: dict, chat: dict) -> None:
-    """Системный бот в личке: `/start` → keyboard с request_contact,
-    contact-share → core-registry /telegram/link-and-magic для линка
-    Employee и выдачи magic-link'а. Прочие сообщения игнорируем.
+    """Системный бот в личке. Два потока, оба без contact-share:
+
+      A) /start (без payload) или /start login — Quick login. Лукап по
+         tg_user_id в core. Если найдена EmployeeTelegram-привязка —
+         выдаём magic-link сразу.
+
+      B) /start link_<email_token> — первичная привязка. Сразу зовём
+         core /telegram/email-link с tg_user_id отправителя + token.
+         Core валидирует token, создаёт EmployeeTelegram, минтит
+         magic-link. Бот показывает inline-кнопку «Войти в портал».
+
+      Никаких contact-share, request_contact или phone-сверки —
+      email-токен из персонального письма сам по себе анкор владения.
+      Прочие сообщения молча игнорируем.
     """
     from_user = msg.get("from") or {}
     text = (msg.get("text") or "").strip()
-    contact = msg.get("contact") or None
     bot_token = (ch.config or {}).get("bot_token")
     if not bot_token:
         return
+    core_url = os.environ.get("CORE_REGISTRY_URL", "http://core-registry:5001")
+    tg_user_id = from_user.get("id")
 
-    # Принимаем /start как с payload'ом, так и без. Payload приходит из
-    # deep-link'ов вида https://t.me/<bot>?start=login (из /login →
-    # Telegram-вкладка) или ?start=<custom>. Сам payload пока не нужен —
-    # любой вариант кикает off contact-share flow.
-    if text == "/start" or text.startswith("/start "):
-        _dm_with_log(
-            ch, bot_token, chat["id"],
-            text=(
-                "👋 <b>Привет! Это CORPER.</b>\n\n"
-                "Чтобы войти в портал, мне нужен ваш номер телефона "
-                "— по нему я найду вашу учётную запись.\n\n"
-                "Нажмите кнопку <b>«📞 Поделиться номером»</b> ниже — "
-                "Telegram передаст его автоматически."
-            ),
-            event_type="auth.start",
-            reply_markup={
-                "keyboard": [[{"text": "📞 Поделиться номером",
-                                "request_contact": True}]],
-                "resize_keyboard": True, "one_time_keyboard": True,
-            },
-        )
+    if not (text == "/start" or text.startswith("/start ")):
+        # Контакт-сообщения и прочее в этом потоке не нужны —
+        # игнорируем, не сбивая юзера с толку.
         return
 
-    if contact:
-        phone = contact.get("phone_number")
-        core_url = os.environ.get("CORE_REGISTRY_URL", "http://core-registry:5001")
+    payload = text[7:].strip() if text.startswith("/start ") else ""
+
+    # ── Flow B: первичная привязка по email-токену ──────────────
+    if payload.startswith("link_"):
+        token = payload[5:].strip()
+        if not token or not tg_user_id:
+            _dm_with_log(ch, bot_token, chat["id"],
+                          text="❌ Ссылка из письма некорректна. Запросите новое письмо.",
+                          event_type="auth.link_no_token")
+            return
         try:
             r = requests.post(
-                f"{core_url}/telegram/link-and-magic",
-                json={
-                    "phone_number": phone,
-                    "tg_user_id": from_user.get("id"),
-                    "tg_username": from_user.get("username"),
-                    "tg_chat_id": chat.get("id"),
-                },
+                f"{core_url}/telegram/email-link",
+                json={"email_token": token,
+                      "tg_user_id": tg_user_id,
+                      "tg_username": from_user.get("username"),
+                      "tg_chat_id": chat.get("id")},
                 timeout=10,
             )
             resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
         except Exception as e:
-            log.error("link-and-magic call failed: %s", e)
-            _dm_with_log(
-                ch, bot_token, chat["id"],
-                text="⚠ Временная ошибка. Попробуйте позже.",
-                event_type="auth.link_and_magic_error",
-                reply_markup={"remove_keyboard": True},
-            )
+            log.error("email-link call failed: %s", e)
+            _dm_with_log(ch, bot_token, chat["id"],
+                          text="⚠ Временная ошибка. Попробуйте через минуту.",
+                          event_type="auth.email_link_error")
             return
 
         if resp.get("ok"):
-            # Дифференцируем «активация» / «повторный вход»:
-            #   was_activated=True  → онбординг (welcome + intro)
-            #   was_activated=False → лаконичное «ваша ссылка для входа»
-            # Имя берём first-name по пробелу — чтобы обращение было личным.
-            name_full = (resp.get("employee_name") or "").strip()
-            first_name = name_full.split()[0] if name_full else ""
-            greeting_name = f", {first_name}" if first_name else ""
             if resp.get("was_activated"):
-                header = (f"🎉 <b>Добро пожаловать в CORPER{greeting_name}!</b>")
-                intro = (
-                    "Учётная запись успешно привязана и активирована.\n"
-                    "Откройте портал по этой ссылке — она сразу выполнит вход."
-                )
+                header = f"🎉 <b>Добро пожаловать в CORPER{_greeting_for(resp)}!</b>"
+                intro = ("Telegram привязан к вашей учётной записи.\n"
+                          "Нажмите кнопку ниже, чтобы войти в портал.")
                 event_type = "auth.welcome_magic_link"
             else:
-                header = f"🔐 <b>Вход в портал{greeting_name}</b>"
-                intro = (
-                    "Telegram привязан к вашей учётной записи.\n"
-                    "Ваша одноразовая ссылка для входа готова."
-                )
+                header = f"🔐 <b>Вход в портал{_greeting_for(resp)}</b>"
+                intro = "Ваша одноразовая ссылка для входа готова."
                 event_type = "auth.magic_link"
-            code = resp.get("magic_code") or ""
-            _dm_with_log(
-                ch, bot_token, chat["id"],
-                text=(
-                    f"{header}\n\n"
-                    f"{intro}\n\n"
-                    f"🔗 <a href=\"{resp.get('magic_url')}\">Войти в портал</a>\n\n"
-                    f"<i>или скопируйте код (нажмите, чтобы выделить):</i>\n"
-                    f"<code>{code}</code>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏱ Действует <b>15 минут</b>\n"
-                    f"🛡 Если вы не запрашивали вход — просто проигнорируйте это сообщение."
-                ),
-                event_type=event_type,
-                reply_markup={"remove_keyboard": True},
-            )
-        else:
-            err_code = resp.get("error") or "unknown"
-            human = {
-                "phone_not_registered": (
-                    "❌ Этот номер не зарегистрирован в портале. "
-                    "Обратитесь к администратору компании."
-                ),
-                "phone_invalid": "❌ Номер телефона некорректен.",
-            }.get(err_code, f"❌ Ошибка: {err_code}")
-            _dm_with_log(
-                ch, bot_token, chat["id"], text=human,
-                event_type=f"auth.phone_error.{err_code}",
-                reply_markup={"remove_keyboard": True},
-            )
+            _reply_magic_link(ch, bot_token, chat["id"], resp,
+                              event_type=event_type, header=header, intro=intro)
+            return
+
+        err = resp.get("error") or "unknown"
+        human = {
+            "token_invalid": "❌ Ссылка из письма не найдена или уже использована. Запросите новое письмо.",
+            "token_expired": "❌ Ссылка из письма просрочена (48 часов). Запросите новое письмо.",
+            "tg_already_linked": "❌ Этот Telegram-аккаунт уже привязан к другому сотруднику. Обратитесь к админу.",
+            "employee_missing": "❌ Учётная запись не найдена.",
+        }.get(err, f"❌ Ошибка: {err}")
+        _dm_with_log(ch, bot_token, chat["id"], text=human,
+                      event_type=f"auth.email_link_error.{err}")
         return
-    # Прочие private-сообщения молча игнорируем (фаза 6 — DM-команды).
+
+    # ── Flow A: Quick login (без payload или /start login) ──────
+    try:
+        r = requests.post(
+            f"{core_url}/telegram/quick-login",
+            json={"tg_user_id": tg_user_id,
+                  "tg_username": from_user.get("username"),
+                  "tg_chat_id": chat.get("id")},
+            timeout=10,
+        )
+        resp = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception as e:
+        log.error("quick-login call failed: %s", e)
+        _dm_with_log(ch, bot_token, chat["id"],
+                      text="⚠ Временная ошибка. Попробуйте позже.",
+                      event_type="auth.quick_login_error")
+        return
+
+    if resp.get("ok"):
+        _reply_magic_link(ch, bot_token, chat["id"], resp,
+                          event_type="auth.quick_login",
+                          header=f"🔐 <b>Вход в портал{_greeting_for(resp)}</b>",
+                          intro="Ваша одноразовая ссылка для входа готова.")
+        return
+
+    err = resp.get("error") or "unknown"
+    human = {
+        "not_linked": ("👋 <b>Здравствуйте!</b>\n\n"
+                        "Я ещё не знаю вашу учётную запись. Чтобы войти "
+                        "в первый раз — запросите письмо со ссылкой на "
+                        "странице входа портала, затем откройте ссылку из "
+                        "письма."),
+        "employee_inactive": "❌ Учётная запись отключена. Свяжитесь с администратором компании.",
+    }.get(err, f"❌ Ошибка: {err}")
+    _dm_with_log(ch, bot_token, chat["id"], text=human,
+                  event_type=f"auth.quick_login_error.{err}")
 
 
 def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
@@ -676,6 +847,53 @@ def _poll_channel(ch: Channel) -> None:
         db.session.commit()
 
 
+def _sync_system_bot_from_core() -> None:
+    """Синк токена системного бота из core.platform_setting → системный
+    TG-канал в pg-mailer (company_id IS NULL).
+
+    Source of truth перенесён в core (админка /admin/notifications пишет
+    platform_setting.system_tg_bot_token). Worker подхватывает смену токена
+    за один цикл поллинга: обновляет channel.config (poll/health/DM-машинерия
+    остаётся на Channel/PollState без изменений).
+    """
+    if _core_engine is None:
+        return
+    from sqlalchemy import text as sql_text
+    try:
+        with _core_engine.connect() as conn:
+            row = conn.execute(sql_text(
+                "SELECT value FROM core.platform_setting "
+                "WHERE key = 'system_tg_bot_token'")).first()
+    except Exception as e:
+        log.warning("core platform_setting read failed: %s", e)
+        return
+    token = (row[0] or "").strip() if row else ""
+    if not token:
+        return  # в core не задан — оставляем legacy-конфиг канала как есть
+
+    ch = (Channel.query
+          .filter(Channel.kind == "telegram", Channel.company_id.is_(None))
+          .order_by(Channel.id.asc()).first())
+    if ch is None:
+        ch = Channel(company_id=None, kind="telegram", is_enabled=True,
+                     label="Системный бот", config={})
+        db.session.add(ch)
+    cfg = dict(ch.config or {})
+    if cfg.get("bot_token") == token and ch.is_enabled:
+        return  # уже синхронизирован
+    cfg["bot_token"] = token
+    try:
+        me = tg_get_me(token)
+        cfg["bot_id"] = (me or {}).get("id")
+        cfg["bot_username"] = (me or {}).get("username")
+    except TelegramError as e:
+        log.warning("system bot getMe failed on sync: %s", e)
+    ch.config = cfg
+    ch.is_enabled = True
+    db.session.commit()
+    log.info("system bot token synced from core (bot=%s)", cfg.get("bot_username"))
+
+
 def thread_b_polling():
     """Один поток крутит ВСЕ включённые telegram-каналы по очереди.
 
@@ -687,6 +905,7 @@ def thread_b_polling():
     while not _shutdown.is_set():
         with app.app_context():
             try:
+                _sync_system_bot_from_core()
                 channels = Channel.query.filter(
                     Channel.kind == "telegram",
                     Channel.is_enabled.is_(True),
@@ -721,6 +940,7 @@ def main():
         threading.Thread(target=thread_a_outbox, name="outbox", daemon=True),
         threading.Thread(target=thread_b_polling, name="polling", daemon=True),
         threading.Thread(target=thread_c_health, name="health", daemon=True),
+        threading.Thread(target=thread_d_mailwatch, name="mailwatch", daemon=True),
     ]
     for t in threads:
         t.start()

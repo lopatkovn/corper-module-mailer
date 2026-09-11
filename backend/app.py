@@ -989,6 +989,10 @@ def admin_send_dm():
     text = data.get("text")
     if not chat_id or not text:
         return jsonify({"error": "chat_id and text required"}), 400
+    # Optional inline-keyboard / keyboard markup. Используется magic-link
+    # для URL-кнопки — TG открывает URL-button во внешнем браузере (в Chrome
+    # сработает PWA-capture_links), а HTML <a href> — в WebView.
+    reply_markup = data.get("reply_markup")
     c = (Channel.query
                  .filter(Channel.company_id.is_(None),
                          Channel.kind == "telegram",
@@ -1015,7 +1019,8 @@ def admin_send_dm():
 
     try:
         from delivery_telegram import send_message as tg_send, TelegramError
-        result = tg_send(c.config["bot_token"], int(chat_id), text)
+        result = tg_send(c.config["bot_token"], int(chat_id), text,
+                         reply_markup=reply_markup)
         msg.status = "sent"
         msg.sent_at = datetime.utcnow()
         db.session.commit()

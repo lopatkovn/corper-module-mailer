@@ -6,10 +6,12 @@
 Также есть fallback для legacy core.mail_queue — там SMTP-настройки сидят в
 core.mail_settings (читаем напрямую из pg-core через отдельный engine).
 """
+import io
 import logging
 import smtplib
+from email.generator import BytesGenerator
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, formatdate, make_msgid
 
 
 log = logging.getLogger("mailer-worker.smtp")
@@ -48,8 +50,15 @@ def _humanize_smtp_error(host: str, port: int, exc: Exception) -> str:
 
 
 def send_email(*, to_addr: str, subject: str, body_text: str,
-               body_html: str | None, smtp_cfg: dict) -> None:
+               body_html: str | None, smtp_cfg: dict,
+               message_id: str | None = None) -> dict:
     """Отправить одно письмо. smtp_cfg = mailer.channel.config (или совместимый dict).
+
+    Возвращает след письма: `{"message_id": …, "receipt": "250 … queued as …"}`.
+    Оба поля нужны, когда получатель говорит «письмо не пришло»: по Message-ID
+    к письму привязывается возврат от чужого сервера, а квитанцию релея
+    (ответ на DATA) понимает поддержка хостера — по ней видно, что он принял
+    и что сделал дальше.
 
     Поднимает SMTPError при любой проблеме; worker ловит и пишет в last_error.
     """
@@ -89,6 +98,11 @@ def send_email(*, to_addr: str, subject: str, body_text: str,
     msg["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
     msg["To"] = to_addr
     msg["Subject"] = subject or "(без темы)"
+    # Message-ID ставим сами: если его подставит релей, мы не узнаем значение —
+    # и не свяжем с письмом ни возврат, ни ответ получателя.
+    mid = message_id or make_msgid(domain=(sender_email.split("@")[-1] or "corper.pro"))
+    msg["Message-ID"] = mid
+    msg["Date"] = formatdate(localtime=True)
     msg.set_content(body_text or "")
     if body_html:
         msg.add_alternative(body_html, subtype="html")
@@ -99,7 +113,7 @@ def send_email(*, to_addr: str, subject: str, body_text: str,
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
                 if username:
                     s.login(username, password)
-                s.send_message(msg)
+                receipt = _send_and_read_receipt(s, sender_email, to_addr, msg)
         else:
             with smtplib.SMTP(host, port, timeout=30) as s:
                 s.ehlo()
@@ -108,8 +122,32 @@ def send_email(*, to_addr: str, subject: str, body_text: str,
                     s.ehlo()
                 if username:
                     s.login(username, password)
-                s.send_message(msg)
+                receipt = _send_and_read_receipt(s, sender_email, to_addr, msg)
     except (smtplib.SMTPException, OSError) as e:
         log.warning("smtp send failed host=%s port=%s err=%s: %s",
                     host, port, type(e).__name__, e)
         raise SMTPError(_humanize_smtp_error(host, port, e)) from e
+    log.info("smtp accepted to=%s id=%s receipt=%s", to_addr, mid, receipt)
+    return {"message_id": mid, "receipt": receipt}
+
+
+def _send_and_read_receipt(s: smtplib.SMTP, sender: str, to_addr: str,
+                           msg: EmailMessage) -> str:
+    """Отправить письмо и вернуть ответ сервера на DATA.
+
+    smtplib.send_message ответ релея не отдаёт — он его просто проверяет и
+    выбрасывает. А там как раз лежит номер, под которым письмо легло в очередь
+    хостера («250 2.0.0 Ok: queued as 4X2p…»), поэтому конверт собираем руками.
+    """
+    buf = io.BytesIO()
+    BytesGenerator(buf, mangle_from_=False,
+                   policy=msg.policy.clone(linesep="\r\n")).flatten(msg)
+    s.ehlo_or_helo_if_needed()
+    s.mail(sender)
+    code, resp = s.rcpt(to_addr)
+    if code not in (250, 251):
+        raise smtplib.SMTPRecipientsRefused({to_addr: (code, resp)})
+    code, resp = s.data(buf.getvalue())
+    s.quit()
+    text = resp.decode("utf-8", "replace") if isinstance(resp, bytes) else str(resp)
+    return f"{code} {text}".strip()[:500]

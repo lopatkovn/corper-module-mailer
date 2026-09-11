@@ -220,8 +220,31 @@ def deliver_explicit(
     # event_type — только для каталога/Журнала, не для роутинга
     _lookup_or_create_event_type(db, EventType, event_type_key, source_module)
 
-    ch = Channel.query.filter_by(company_id=company_id, kind=channel_kind,
-                                 is_enabled=True).first()
+    # Выбор канала.
+    # • email — внешние адресаты (поставщики, клиенты, активационные письма
+    #   на личную почту). Канон: письма уходят с адреса портала, чтобы
+    #   получатель видел консистентный бренд платформы и SPF/DKIM работал.
+    #   Поэтому system-channel (company_id IS NULL) приоритетнее per-tenant.
+    # • telegram — внутренние сотрудники через tenant-bot. Per-tenant
+    #   приоритетнее системного.
+    if channel_kind == "email":
+        ch = (Channel.query
+                     .filter(Channel.company_id.is_(None),
+                             Channel.kind == "email",
+                             Channel.is_enabled.is_(True))
+                     .first())
+        if ch is None:
+            ch = Channel.query.filter_by(company_id=company_id, kind="email",
+                                         is_enabled=True).first()
+    else:
+        ch = Channel.query.filter_by(company_id=company_id, kind=channel_kind,
+                                     is_enabled=True).first()
+        if ch is None:
+            ch = (Channel.query
+                         .filter(Channel.company_id.is_(None),
+                                 Channel.kind == channel_kind,
+                                 Channel.is_enabled.is_(True))
+                         .first())
     if ch is None:
         db.session.commit()
         return {"error": f"channel {channel_kind} not configured for company",
