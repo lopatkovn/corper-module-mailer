@@ -48,30 +48,38 @@ def _hdr(msg, name: str) -> str:
 # ── Тревога в Telegram ────────────────────────────────────────────────────
 
 def alert_admins(core_engine, tg_send, bot_token: str, text: str) -> int:
-    """Отправить тревогу всем super_admin, у кого привязан Telegram.
+    """Отправить тревогу дежурному чату, а если он не задан — админам лично.
 
-    Возвращает число доставленных сообщений. Ноль — не ошибка вызывающего:
-    значит, ни у одного администратора нет привязки, и это стоит починить,
-    поэтому громко пишем в лог.
+    Служебный чат главнее личных сообщений: системная тревога адресована
+    роли, а не человеку — в чате её видит тот, кто на смене, и она не теряется
+    в личной переписке уволившегося администратора. Поэтому если задан
+    `platform_setting.mail_alert_chat_id`, шлём ТОЛЬКО туда.
+
+    Личные сообщения super_admin'ам остаются запасным вариантом: пока чат не
+    назначен, тревога всё равно должна кого-то найти.
+
+    Возвращает число доставленных сообщений; ноль — громко в лог, потому что
+    молча потерянная тревога хуже отсутствующей.
     """
     if core_engine is None or not bot_token:
         log.warning("alert: нет core-подключения или токена бота — тревога не ушла")
         return 0
     with core_engine.begin() as conn:
-        rows = conn.execute(sql_text(
-            "SELECT DISTINCT t.tg_user_id FROM core.employee_telegram t "
-            "JOIN core.employee e ON e.id = t.employee_id "
-            "WHERE e.is_super_admin AND e.is_active AND t.tg_user_id IS NOT NULL"
-        )).mappings().all()
-        extra = conn.execute(sql_text(
+        chat = conn.execute(sql_text(
             "SELECT value FROM core.platform_setting WHERE key='mail_alert_chat_id'"
         )).scalar()
-    targets = [r["tg_user_id"] for r in rows]
-    if extra and str(extra).strip():
-        targets.append(str(extra).strip())
+        if chat and str(chat).strip():
+            targets = [str(chat).strip()]
+        else:
+            rows = conn.execute(sql_text(
+                "SELECT DISTINCT t.tg_user_id FROM core.employee_telegram t "
+                "JOIN core.employee e ON e.id = t.employee_id "
+                "WHERE e.is_super_admin AND e.is_active AND t.tg_user_id IS NOT NULL"
+            )).mappings().all()
+            targets = [r["tg_user_id"] for r in rows]
     if not targets:
-        log.warning("alert: ни у одного super_admin не привязан Telegram — тревога «%s» не ушла",
-                    text[:80])
+        log.warning("alert: не задан дежурный чат и ни у одного super_admin нет "
+                    "привязки в Telegram — тревога «%s» не ушла", text[:80])
         return 0
     sent = 0
     for chat_id in targets:
