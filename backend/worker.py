@@ -813,6 +813,89 @@ def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
     db.session.commit()
 
 
+# ── Платформенная очередь Telegram для модулей ─────────────────────────────
+#
+# Бот у портала один, и опрашивать его можно только отсюда: getUpdates забирает
+# обновление навсегда, второй поллер начал бы красть сообщения. Поэтому всё,
+# что пришло, складываем в core.tg_update — а модули читают очередь со своим
+# курсором и отвечают через платформенный бот (API в ядре).
+#
+# Пишем прямо в pg-core тем же engine, что и legacy-мост core.mail_queue:
+# заводить ради этого отдельный токен и HTTP-вызов незачем.
+
+def _core_tg_cfg() -> dict:
+    """Параметры опроса из core.platform_setting (их правит админка бота)."""
+    cfg = {"enabled": True, "timeout": POLL_TIMEOUT_SEC,
+           "allowed": ["message", "my_chat_member", "channel_post"]}
+    if _core_engine is None:
+        return cfg
+    from sqlalchemy import text as sql_text
+    try:
+        with _core_engine.connect() as conn:
+            rows = conn.execute(sql_text(
+                "SELECT key, value FROM core.platform_setting "
+                "WHERE key IN ('tg_poll_enabled','tg_poll_timeout','tg_poll_allowed')"
+            )).all()
+    except Exception as e:
+        log.warning("core: параметры опроса недоступны: %s", e)
+        return cfg
+    got = {k: (v or "") for k, v in rows}
+    if "tg_poll_enabled" in got:
+        cfg["enabled"] = got["tg_poll_enabled"] != "false"
+    if got.get("tg_poll_timeout", "").isdigit():
+        cfg["timeout"] = max(0, min(int(got["tg_poll_timeout"]), 60))
+    if got.get("tg_poll_allowed"):
+        cfg["allowed"] = [x.strip() for x in got["tg_poll_allowed"].split(",") if x.strip()]
+    return cfg
+
+
+def _tg_flat(u: dict) -> dict:
+    """Плоские поля обновления: по ним модули фильтруют, не разбирая raw."""
+    msg = u.get("message") or u.get("channel_post") or {}
+    chat = msg.get("chat") or ((u.get("my_chat_member") or {}).get("chat")) or {}
+    frm = msg.get("from") or ((u.get("my_chat_member") or {}).get("from")) or {}
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    cmd = ""
+    if text.startswith("/"):
+        # В группе Telegram дописывает имя бота: «/connect@corper_pro_bot 12».
+        cmd = text.split()[0].split("@")[0][:40]
+    kind = ("my_chat_member" if "my_chat_member" in u
+            else "channel_post" if "channel_post" in u else "message")
+    name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x) \
+        or frm.get("username") or ""
+    return {
+        "update_id": int(u.get("update_id") or 0), "kind": kind,
+        "chat_id": chat.get("id"), "chat_type": (chat.get("type") or "")[:16],
+        "chat_title": (chat.get("title") or chat.get("username") or "")[:200],
+        "topic_id": msg.get("message_thread_id"),
+        "from_id": frm.get("id"), "from_name": name[:200],
+        "text": text, "command": cmd,
+    }
+
+
+def _publish_to_core(updates: list) -> None:
+    """Сложить пачку в очередь ядра. Дубли отсекает update_id."""
+    if _core_engine is None or not updates:
+        return
+    import json as _json
+    from sqlalchemy import text as sql_text
+    try:
+        with _core_engine.begin() as conn:
+            for u in updates:
+                row = _tg_flat(u)
+                if not row["update_id"]:
+                    continue
+                conn.execute(sql_text(
+                    "INSERT INTO core.tg_update (update_id, kind, chat_id, chat_type,"
+                    " chat_title, topic_id, from_id, from_name, text, command, raw)"
+                    " VALUES (:update_id, :kind, :chat_id, :chat_type, :chat_title,"
+                    " :topic_id, :from_id, :from_name, :text, :command, CAST(:raw AS JSONB))"
+                    " ON CONFLICT (update_id) DO NOTHING"),
+                    {**row, "raw": _json.dumps(u, ensure_ascii=False)})
+    except Exception as e:
+        log.warning("core.tg_update: пачка не записана: %s", e)
+
+
 def _poll_channel(ch: Channel) -> None:
     """Один цикл getUpdates для одного канала."""
     cfg = ch.config or {}
@@ -822,17 +905,26 @@ def _poll_channel(ch: Channel) -> None:
         time.sleep(5)
         return
     st = _ensure_poll_state(ch.id)
+    cfg = _core_tg_cfg()
+    if not cfg["enabled"]:
+        # Опрос выключен в админке бота: держать соединение впустую незачем.
+        time.sleep(10)
+        return
     try:
         updates = tg_get_updates(
             bot_token,
             offset=st.last_update_id + 1,
-            timeout=POLL_TIMEOUT_SEC,
-            allowed_updates=["message", "my_chat_member", "channel_post"],
+            timeout=cfg["timeout"],
+            allowed_updates=cfg["allowed"],
         )
     except TelegramError as e:
         log.warning("getUpdates channel=%s failed: %s", ch.id, e)
         time.sleep(10)
         return
+
+    # Сначала в общую очередь, потом разбор: если разбор упадёт, модули всё
+    # равно получат сообщение — у Telegram его уже не перезапросить.
+    _publish_to_core(updates)
 
     max_uid = st.last_update_id
     for u in updates:
