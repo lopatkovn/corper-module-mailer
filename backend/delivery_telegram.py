@@ -6,10 +6,25 @@
 Лимиты Telegram обеспечивает rate_limit.BotRateLimiter перед вызовом
 send_message (worker thread A).
 """
+import os
+
 import requests
 
 
 TG_API = "https://api.telegram.org"
+# Telegram — через VPN-шлюз портала (в РФ его замедляют). Шлюз недоступен →
+# одна попытка напрямую, чтобы рассылки и поллер бота не вставали вместе с VPN.
+TG_PROXY = (os.environ.get("TELEGRAM_PROXY_URL") or "").strip()
+
+
+def _post(url: str, payload: dict, timeout: float):
+    if TG_PROXY:
+        try:
+            return requests.post(url, json=payload, timeout=timeout,
+                                 proxies={"https": TG_PROXY, "http": TG_PROXY})
+        except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError):
+            pass
+    return requests.post(url, json=payload, timeout=timeout)
 
 
 class TelegramError(Exception):
@@ -27,7 +42,7 @@ def _request(bot_token: str, method: str, **params) -> dict:
         raise TelegramError("bot_token не задан")
     url = f"{TG_API}/bot{bot_token}/{method}"
     try:
-        r = requests.post(url, json=params, timeout=35)
+        r = _post(url, params, 35)
     except requests.RequestException as e:
         raise TelegramError(f"HTTP {type(e).__name__}: {e}") from e
     try:
@@ -160,7 +175,7 @@ def get_updates(bot_token: str, offset: int = 0, timeout: int = 25,
     if allowed_updates is not None:
         payload["allowed_updates"] = allowed_updates
     try:
-        r = requests.post(url, json=payload, timeout=timeout + 10)
+        r = _post(url, payload, timeout + 10)
     except requests.RequestException as e:
         raise TelegramError(f"HTTP {type(e).__name__}: {e}") from e
     try:

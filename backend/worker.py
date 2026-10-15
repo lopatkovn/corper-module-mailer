@@ -790,25 +790,9 @@ def _handle_update(ch: Channel, update: dict, bot_id: int) -> None:
     )
     db.session.add(inbound)
 
-    # простые команды /start /status — отвечаем приветствием/статусом
-    if text and text.strip().startswith("/"):
-        cmd = text.strip().split()[0].lower().split("@")[0]
-        cfg = ch.config or {}
-        bot_token = cfg.get("bot_token")
-        try:
-            if cmd == "/start":
-                tg_send(bot_token, chat_id,
-                        "Бот рассылок CORPER подключён. Группа будет автоматически "
-                        "зарегистрирована, привяжите её к филиалу в /org/notifications.")
-            elif cmd == "/status":
-                g = TelegramGroup.query.filter_by(
-                    company_id=ch.company_id, chat_id=int(chat_id)).first()
-                bid = g.branch_id if g else None
-                tg_send(bot_token, chat_id,
-                        f"Статус: chat_id=<code>{chat_id}</code>, "
-                        f"филиал={'не назначен' if not bid else bid}")
-        except TelegramError as e:
-            log.warning("команда %s failed: %s", cmd, e)
+    # Команды в группах (/connect, /status, /help) отвечает ядро: там
+    # филиалы и привязки чатов. Отвечать ещё и отсюда значило бы два разных
+    # ответа на одно сообщение.
 
     db.session.commit()
 
@@ -894,6 +878,28 @@ def _publish_to_core(updates: list) -> None:
                     {**row, "raw": _json.dumps(u, ensure_ascii=False)})
     except Exception as e:
         log.warning("core.tg_update: пачка не записана: %s", e)
+        return
+    _ping_core_dispatch()
+
+
+def _ping_core_dispatch() -> None:
+    """Толкнуть ядро разобрать команды бота (/connect и прочие).
+
+    Разбор живёт в ядре — там филиалы и привязки, — но собственного цикла у
+    ядра нет: gunicorn без фоновых потоков. Поэтому толчок приходит отсюда,
+    сразу после getUpdates, чтобы ответ в чате был мгновенным.
+    """
+    token = os.environ.get("CORE_INTERNAL_TOKEN", "")
+    if not token:
+        return
+    import requests
+    url = os.environ.get("CORE_REGISTRY_URL", "http://core-registry:5001")
+    try:
+        requests.post(f"{url}/api/internal/tg/dispatch",
+                      json={}, timeout=15,
+                      headers={"X-Corper-Internal-Token": token})
+    except Exception as e:
+        log.warning("core: разбор команд не запущен: %s", e)
 
 
 def _poll_channel(ch: Channel) -> None:
